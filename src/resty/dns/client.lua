@@ -125,10 +125,17 @@ local cacheinsert = function(entry, qname, qtype)
       -- an actual record
       key = (qtype or e1.type) .. ":" .. (qname or e1.name)
       
-      -- determine minimum ttl of all answer records
-      ttl = e1.ttl
-      for i = 2, #entry do
-        ttl = math_min(ttl, entry[i].ttl)
+      ttl = math.huge
+      for i = 1, #entry do
+        local record = entry[i]
+        -- determine minimum ttl of all answer records
+        ttl = math_min(ttl, record.ttl)
+        -- update IPv6 address format to include square brackets
+        if record.type == _M.TYPE_AAAA then
+          record.address = utils.parseHostname(record.address)
+        elseif record.type == _M.TYPE_SRV then -- SRV can also contain IPv6
+          record.target = utils.parseHostname(record.target)
+        end
       end
 
     elseif entry.errcode and entry.errcode ~= 3 then
@@ -724,7 +731,12 @@ local function check_ipv6(qname, qtype, try_list)
     return record, nil, try_list
   end
 
-  local check = qname
+  local check = qname:match("^%[(.+)%]$")  -- grab contents of "[ ]"
+  if not check then
+    -- no square brackets found
+    check = qname
+  end
+
   if check:sub(1,1) == ":" then check = "0"..check end
   if check:sub(-1,-1) == ":" then check = check.."0" end
   if check:find("::") then
@@ -1248,7 +1260,7 @@ end
 -- @param dnsCacheOnly Only check the cache, won't do server lookups (will 
 -- not invalidate any ttl expired data and will hence possibly return expired data)
 -- @param try_list (optional) list of tries to add to
--- @return `ip address + port + r + try_list`, or in case of an error `nil + error + r + try_list`
+-- @return `ip address + port + try_list`, or in case of an error `nil + error + try_list`
 local function toip(qname, port, dnsCacheOnly, try_list)
   local rec, err
   rec, err, try_list = resolve(qname, nil, dnsCacheOnly, try_list)

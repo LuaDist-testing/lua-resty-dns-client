@@ -1,16 +1,16 @@
 -- This file was automatically generated for the LuaDist project.
 
 package = "lua-resty-dns-client"
-version = "0.6.0-1"
+version = "0.6.1-1"
 -- LuaDist source
 source = {
-  tag = "0.6.0-1",
+  tag = "0.6.1-1",
   url = "git://github.com/LuaDist-testing/lua-resty-dns-client.git"
 }
 -- Original source
 -- source = {
---   url = "https://github.com/Mashape/lua-resty-dns-client/archive/0.6.0.tar.gz",
---   dir = "lua-resty-dns-client-0.6.0"
+--   url = "https://github.com/Mashape/lua-resty-dns-client/archive/0.6.1.tar.gz",
+--   dir = "lua-resty-dns-client-0.6.1"
 -- }
 description = {
   summary = "DNS library",
@@ -24,6 +24,7 @@ description = {
 dependencies = {
   "lua >= 5.1, < 5.4",
   "penlight > 1.1, < 2.0",
+  "lrandom",
 }
 build = {
   type = "builtin",

@@ -3,7 +3,7 @@ Overview
 
 Lua library containing a dns client, several utilities, and a load-balancer.
 
-The module is currently OpenResty only, and builds on top of the 
+The module is currently OpenResty only, and builds on top of the
 [`lua-resty-dns`](https://github.com/openresty/lua-resty-dns) library
 
 Features
@@ -37,6 +37,19 @@ History
 
 Versioning is strictly based on [Semantic Versioning](https://semver.org/)
 
+### 2.1.0 (21-May-2018) Fixes
+
+- Fix: the round robin scheme for the balanceer starts at a randomized position
+  to prevent all workers from starting with the same peer.
+- Fix: the balancer no longer returns `port = 0` for SRV records without a
+  port, the default port is now returned.
+- Fix: ipv6 nameservers with a scope in their address are not supported. This
+  fix will simply skip them instead of throwing errors upon resolving. Fixes
+  [issue 43](https://github.com/Kong/lua-resty-dns-client/issues/43).
+- Minor: improved logging in the balancer
+- Minor: relax requery default interval for failed dns queries from 1 to 30
+  seconds.
+
 ### 2.0.0 (22-Feb-2018) Major performance improvement (balancer) and bugfixes
 
 - BREAKING: improved performance and memory footprint for large balancers.
@@ -44,7 +57,7 @@ Versioning is strictly based on [Semantic Versioning](https://semver.org/)
   the `host:getPeer()` function signature changed, this is a breaking change.
 - Change: BREAKING the errors for cache-only lookup failures and empty records
   have been changed.
-- Fix: do not fail initialization without nameservers. 
+- Fix: do not fail initialization without nameservers.
 - Fix: properly recognize IPv6 in square brackets from the /etc/hosts file.
 - Fix: do not set success-type to types we're not looking for. Fixes
   [Kong issue #3210](https://github.com/Kong/kong/issues/3210).
@@ -147,15 +160,15 @@ Versioning is strictly based on [Semantic Versioning](https://semver.org/)
 - change: max life-time interval configurable for ttl=0 dns records (ring-balancer)
 
 ### 0.2.1 (24-Oct-2016) Bugfix
- 
+
 - fix: `toip()` failed on SRV records with only 1 entry
 
 ### 0.2 (18-Oct-2016) Added the balancer
- 
+
 - fix: was creating resolver objects even if serving from cache
 - change: change resolver order (SRV is now first by default) for dns servers that create both SRV and A records for each entry
 - feature: make resolver order configurable
 - feature: ring-balancer (experimental, no full test coverage yet)
 - other: more test coverage for the dns client
-   
+
 ### 0.1 (09-Sep-2016) Initial released version

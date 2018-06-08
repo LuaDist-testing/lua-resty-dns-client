@@ -30,7 +30,7 @@
 -- function, have an `__` prefix (double underscores).
 --
 -- @author Thijs Schreijer
--- @copyright Mashape Inc. All rights reserved.
+-- @copyright 2016-2017 Kong Inc. All rights reserved.
 -- @license Apache 2.0
 
 
@@ -38,6 +38,9 @@ local DEFAULT_WEIGHT = 10   -- default weight for a host, if not provided
 local DEFAULT_PORT = 80     -- Default port to use (A and AAAA only) when not provided
 local TTL_0_RETRY = 60      -- Maximum life-time for hosts added with ttl=0, requery after it expires
 local REQUERY_INTERVAL = 1  -- Interval for requerying failed dns queries
+local ERR_SLOT_REASSIGNED = "Cannot get peer, current slot got reassigned"
+local ERR_ADDRESS_UNAVAILABLE = "Address is marked as unavailable"
+local ERR_NO_PEERS_AVAILABLE = "No peers are available"
 
 local bit = require "bit"
 local dns = require "resty.dns.client"
@@ -49,6 +52,7 @@ local empty = setmetatable({},
 local time = ngx.now
 local table_sort = table.sort
 local table_remove = table.remove
+local table_concat = table.concat
 local math_floor = math.floor
 local string_sub = string.sub
 local ngx_md5 = ngx.md5_bin
@@ -100,13 +104,20 @@ end
 local objAddr = {}
 
 -- Returns the peer info.
--- @return ip-address, port and hostname of the target
+-- @return ip-address, port and hostname of the target, or nil+err if unavailable
+-- or lookup error
 function objAddr:getPeer(cacheOnly)
+  if not self.available then
+    return nil, ERR_ADDRESS_UNAVAILABLE
+  end
+
   if self.ipType == "name" then
     -- SRV type record with a named target
     local ip, port = dns.toip(self.ip, self.port, cacheOnly)
-    -- TODO: which is the proper name to return in this case?
+    -- which is the proper name to return in this case?
     -- `self.host.hostname`? or the named SRV entry: `self.ip`?
+    -- use our own hostname, as it might be used to mark this address
+    -- as unhealthy, so we must be able to find it
     return ip, port, self.host.hostname
   else
     -- just an IP address
@@ -191,6 +202,8 @@ function objAddr:delete()
           " (host ", (self.host or empty).hostname, ")")
 
   assert(#self.slots == 0, "Cannot delete address while it contains slots")
+  self.host.balancer:callback("removed", self.ip,
+                              self.port, self.host.hostname)
   self.host = nil
 end
 
@@ -203,6 +216,11 @@ function objAddr:change(newWeight)
 
   self.host:addWeight(newWeight - self.weight)
   self.weight = newWeight
+end
+
+-- Set the availability of the address.
+function objAddr:setState(available)
+  self.available = not not available -- force to boolean
 end
 
 -- creates a new address object.
@@ -218,6 +236,7 @@ local newAddress = function(ip, port, weight, host)
     ipType = utils.hostnameType(ip),  -- 'ipv4', 'ipv6' or 'name'
     port = port,
     weight = weight,
+    available = true,     -- is this target available?
     host = host,          -- the host this address belongs to
     slots = {},           -- the slots assigned to this address
     index = nil,          -- reverse index in the ordered part of the containing balancer
@@ -227,7 +246,9 @@ local newAddress = function(ip, port, weight, host)
   
   host:addWeight(weight)
 
-  ngx_log(ngx_DEBUG, log_prefix, "new address for host '",host.hostname,"' created: ", ip, ":", port, " (weight ",weight,")")
+  ngx_log(ngx_DEBUG, log_prefix, "new address for host '", host.hostname,
+          "' created: ", ip, ":", port, " (weight ", weight,")")
+  host.balancer:callback("added", ip, port, host.hostname)
   return addr
 end
 
@@ -466,11 +487,18 @@ end
 -- Adds an `address` object to the `host`.
 -- @param entry (table) DNS entry
 function objHost:addAddress(entry)
+  local weight = entry.weight  -- nil for anything else than SRV
+  if weight == 0 then
+    -- Special case: SRV with weight = 0 should be included, but with
+    -- the lowest possible probability of being hit. So we force it to
+    -- weight 1.
+    weight = 1
+  end
   local addresses = self.addresses
   addresses[#addresses+1] = newAddress(
-    entry.address or entry.target, 
-    entry.port or self.port, 
-    entry.weight or self.nodeWeight, 
+    entry.address or entry.target,
+    entry.port or self.port,
+    weight or self.nodeWeight,
     self
   )
 end
@@ -532,17 +560,17 @@ end
 -- Gets address and port number from a specific slot owned by the host.
 -- The slot MUST be owned by the host. Call balancer:getPeer, never this one.
 -- access: balancer:getPeer->slot->address->host->returns addr+port
-function objHost:getPeer(hashValue, cacheOnly, slot)
+function objHost:getPeer(cacheOnly, slot)
   
   if (self.lastQuery.expire or 0) < time() and not cacheOnly then
     -- ttl expired, so must renew
     self:queryDns(cacheOnly)
 
-    if slot.address.host ~= self then
+    if (slot.address or empty).host ~= self then
       -- our slot has been reallocated to another host, so recurse to start over
       ngx_log(ngx_DEBUG, log_prefix, "slot previously assigned to ", self.hostname,
               " was reassigned to another due to a dns update")
-      return self.balancer:getPeer(hashValue, cacheOnly)
+      return nil, ERR_SLOT_REASSIGNED
     end
   end
 
@@ -804,22 +832,100 @@ end
 function objBalancer:getPeer(hashValue, retryCount, cacheOnly)
   local pointer
   if self.weight == 0 then
-    return nil, "No peers are available"
+    return nil, ERR_NO_PEERS_AVAILABLE
   end
   
+  -- calculate starting point
   if hashValue then
-    hashValue = hashValue + (retryCount or 0) -- must update here because we're passing it to getPeer
+    hashValue = hashValue + (retryCount or 0)
     pointer = 1 + (hashValue % self.wheelSize)
   else
     -- no hash, so get the next one, round-robin like
-    pointer = (self.pointer or 0) + 1
-    if pointer > self.wheelSize then pointer = 1 end
-    self.pointer = pointer
+    pointer = self.pointer
+    if pointer < self.wheelSize then
+      self.pointer = pointer + 1
+    else
+      self.pointer = 1
+    end
   end
   
-  local slot = self.wheel[pointer]
-  
-  return slot.address.host:getPeer(hashValue, cacheOnly, slot)
+  local initial_pointer = pointer
+  while true do
+    local slot = self.wheel[pointer]
+    local ip, port, hostname = slot.address.host:getPeer(cacheOnly, slot)
+    if ip then
+      return ip, port, hostname
+    elseif port == ERR_SLOT_REASSIGNED then
+      -- we just need to retry the same slot, no change for 'pointer', just
+      -- in case of dns updates, we need to check our weight again.
+      if self.weight == 0 then
+        return nil, ERR_NO_PEERS_AVAILABLE
+      end
+    elseif port == ERR_ADDRESS_UNAVAILABLE then
+      -- fall through to the next slot
+      if hashValue then
+        pointer = pointer + 1
+        if pointer > self.wheelSize then pointer = 1 end
+      else
+        pointer = self.pointer
+        if pointer < self.wheelSize then
+          self.pointer = pointer + 1
+        else
+          self.pointer = 1
+        end
+      end
+      if pointer == initial_pointer then
+        -- we went around, but still nothing...
+        return nil, ERR_NO_PEERS_AVAILABLE
+      end
+    else
+      -- an unknown error occured
+      return nil, port
+    end
+  end
+
+end
+
+--- Sets the current status of the peer.
+-- This allows to temporarily suspend peers when they are offline/unhealthy,
+-- it will not alter the slot distribution. The parameters passed in should
+-- be previous results from `getPeer`.
+-- @param available `true` for enabled/healthy, `false` for disabled/unhealthy
+-- @param ip ip address of the peer
+-- @param port the port of the peer (in address object, not as recorded with the Host!)
+-- @param hostname (optional, defaults to the value of `ip`) the hostname
+-- @return `true` on success, or `nil+err` if not found
+function objBalancer:setPeerStatus(available, ip, port, hostname)
+  hostname = hostname or ip
+  local name_srv = {}
+  for _, addr, host in self:addressIter() do
+    if host.hostname == hostname and addr.port == port then
+      if addr.ip == ip then
+        -- found it
+        addr:setState(available)
+        return true
+      elseif addr.ipType == "name" then
+        -- so.... the ip is a name. This means that the host that
+        -- was added most likely resolved to an SRV, which then has
+        -- in turn names as targets instead of ip addresses.
+        -- (possibly a fake SRV for ttl=0 records)
+        -- Those names are resolved last minute by `getPeer`.
+        -- TLDR: we don't track the IP in this case, so we cannot match the
+        -- inputs back to an address to disable/enable it.
+        -- We record this fact here, and if we have no match in the end
+        -- we can provide a more specific message
+        name_srv[#name_srv + 1] = addr.ip .. ":" .. addr.port
+      end
+    end
+  end
+  local msg = ("no peer found by name '%s' and address %s:%s"):format(hostname, ip, tostring(port))
+  if name_srv[1] then
+    -- no match, but we did find a named one, so making the message more explicit
+    msg = msg .. ", possibly the IP originated from these nested dns names: " ..
+          table_concat(name_srv, ",")
+    ngx_log(ngx_WARN, log_prefix, msg)
+  end
+  return nil, msg
 end
 
 -- Timer invoked to check for failed queries
@@ -865,6 +971,17 @@ function objBalancer:startRequery()
   end
 end
 
+--- Sets an event callback for user code.
+-- @param callback a function called when an address is added (after DNS
+-- resolution for example). Signature of the callback is
+-- `function(balancer, action, ip, port, hostname)`, where `ip` might also
+-- be a hostname if the DNS resolution returns another name (usually in
+-- SRV records). The `action` parameter will be either "added" or "removed".
+function objBalancer:setCallback(callback)
+  assert(type(callback) == "function", "expected a callback function")
+  self.callback = callback
+end
+
 --- Creates a new balancer. The balancer is based on a wheel with slots. The 
 -- slots will be randomly distributed over the targets. The number of slots 
 -- assigned will be relative to the weight.
@@ -896,16 +1013,21 @@ end
 -- failed queries. Defaults to 1 if omitted (in seconds)
 -- - `ttl0` (optional) Maximum lifetime for records inserted with ttl=0, to verify
 -- the ttl is still 0. Defaults to 60 if omitted (in seconds)
+-- - `callback` (optional) a function called when an address is added (after dns
+-- resolution for example). Signature of the callback is
+-- `function(balancer, action, ip, port, hostname)`, where `ip` might also be a hostname if the
+-- dns resolution returns another name (usually in SRV records). The `action` parameter
+-- will be either "added" or "removed".
 -- @param opts table with options
 -- @return new balancer object or nil+error
 -- @usage -- hosts
 -- local hosts = {
---   "mashape.com",                                     -- name only, as string
+--   "kong.com",                                        -- name only, as string
 --   { name = "gelato.io" },                            -- name only, as table
 --   { name = "getkong.org", port = 80, weight = 25 },  -- fully specified, as table
 -- }
 _M.new = function(opts)
-  assert(type(opts) == "table", "Expected an options table, but got; "..type(opts))
+  assert(type(opts) == "table", "Expected an options table, but got: "..type(opts))
   --assert(type(opts.hosts) == "table", "expected option 'hosts' to be a table")
   --assert(#opts.hosts > 0, "at least one host entry is required in the 'hosts' option")
   assert(opts.dns, "expected option `dns` to be a configured dns client")
@@ -917,19 +1039,23 @@ _M.new = function(opts)
   end
   assert((opts.requery or 1) > 0, "expected 'requery' parameter to be > 0")
   assert((opts.ttl0 or 1) > 0, "expected 'ttl0' parameter to be > 0")
-  
+  assert(type(opts.callback) == "function" or type(opts.callback) == "nil",
+    "expected 'callback' to be a function or nil, but got: " .. type(opts.callback))
+
   local self = {
     -- properties
     hosts = {},    -- a table, index by both the hostname and index, the value being a host object
     weight = 0,    -- total weight of all hosts
     wheel = nil,   -- wheel with entries (fully randomized)
     slots = nil,   -- list of slots in no particular order
+    pointer = 1,   -- pointer to next-up slot for the round robin scheme
     wheelSize = opts.wheelSize or 1000, -- number of entries in the wheel
     dns = opts.dns,  -- the configured dns client to use for resolving
     unassignedSlots = nil, -- list to hold unassigned slots (initially, and when all hosts fail)
     requeryRunning = false,  -- requery timer is not running, see `startRequery`
     requeryInterval = opts.requery or REQUERY_INTERVAL,  -- how often to requery failed dns lookups (seconds)
-    ttl0Interval = opts.ttl0 or TTL_0_RETRY -- refreshing ttl=0 records
+    ttl0Interval = opts.ttl0 or TTL_0_RETRY, -- refreshing ttl=0 records
+    callback = opts.callback or function() end, -- callback for address mutations
   }
   for name, method in pairs(objBalancer) do self[name] = method end
   self.wheel = new_tab(self.wheelSize, 0)
@@ -1000,9 +1126,10 @@ end
 --- Creates a MD5 hash value from a string.
 -- The string will be hashed using MD5, and then shortened to 4 bytes.
 -- The returned hash value can be used as input for the `getpeer` function.
+-- @function hashMd5
 -- @param str (string) value to create the hash from
 -- @return 32-bit numeric hash
-_M.hash_md5 = function(str)
+_M.hashMd5 = function(str)
   local md5 = ngx_md5(str)
   return bxor(
     tonumber(string_sub(md5, 1, 4), 16),
@@ -1015,9 +1142,10 @@ end
 -- The string will be hashed using CRC32. The returned hash value can be
 -- used as input for the `getpeer` function. This is simply a shortcut to
 -- `ngx.crc32_short`.
+-- @function hashCrc32
 -- @param str (string) value to create the hash from
 -- @return 32-bit numeric hash
-_M.hash_crc32 = ngx.crc32_short
+_M.hashCrc32 = ngx.crc32_short
 
 
 return _M

@@ -276,11 +276,11 @@ describe("Loadbalancer", function()
       it("fails without proper options", function()
         assert.has.error(
           function() balancer.new() end, 
-          "Expected an options table, but got; nil"
+          "Expected an options table, but got: nil"
         )
         assert.has.error(
           function() balancer.new("should be a table") end,
-          "Expected an options table, but got; string"
+          "Expected an options table, but got: string"
         )
       end)
       it("fails without proper 'dns' option", function()
@@ -330,6 +330,16 @@ describe("Loadbalancer", function()
           "the 'order' list contains duplicates"
         )
       end)
+      it("fails with a bad callback", function()
+        assert.has.error(
+          function() balancer.new({
+              dns = client,
+              hosts = {"mashape.com"},
+              callback = "not a function",
+            }) end,
+          "expected 'callback' to be a function or nil, but got: string"
+        )
+      end)
       it("succeeds with proper options", function()
         dnsA({ 
           { name = "mashape.com", address = "1.2.3.4" },
@@ -342,6 +352,7 @@ describe("Loadbalancer", function()
           order = {1,2,3,4,5,6,7,8,9,10},
           requery = 2,
           ttl0 = 5,
+          callback = function() end,
         })
       end)
       it("succeeds with the right sizes", function()
@@ -529,6 +540,55 @@ describe("Loadbalancer", function()
         check_balancer(b)
       end)
     end)
+
+    describe("setting status", function()
+      it("valid target is accepted", function()
+        local b = check_balancer(balancer.new { dns = client })
+        dnsA({
+          { name = "kong.inc", address = "4.3.2.1" },
+        })
+        b:addHost("1.2.3.4", 80, 10)
+        b:addHost("kong.inc", 80, 10)
+        local ok, err = b:setPeerStatus(false, "1.2.3.4", 80, "1.2.3.4")
+        assert.is_true(ok)
+        assert.is_nil(err)
+        local ok, err = b:setPeerStatus(false, "4.3.2.1", 80, "kong.inc")
+        assert.is_true(ok)
+        assert.is_nil(err)
+      end)
+      it("invalid target returns an error", function()
+        local b = check_balancer(balancer.new { dns = client })
+        dnsA({
+          { name = "kong.inc", address = "4.3.2.1" },
+        })
+        b:addHost("1.2.3.4", 80, 10)
+        b:addHost("kong.inc", 80, 10)
+        local ok, err = b:setPeerStatus(false, "1.1.1.1", 80)
+        assert.is_nil(ok)
+        assert.equals("no peer found by name '1.1.1.1' and address 1.1.1.1:80", err)
+        local ok, err = b:setPeerStatus(false, "1.1.1.1", 80, "kong.inc")
+        assert.is_nil(ok)
+        assert.equals("no peer found by name 'kong.inc' and address 1.1.1.1:80", err)
+      end)
+      it("SRV target with A record targets returns a descriptive error", function()
+        local b = check_balancer(balancer.new { dns = client })
+        dnsA({
+          { name = "mashape1.com", address = "12.34.56.1" },
+        })
+        dnsA({
+          { name = "mashape2.com", address = "12.34.56.2" },
+        })
+        dnsSRV({ 
+          { name = "mashape.com", target = "mashape1.com", port = 8001, weight = 5 },
+          { name = "mashape.com", target = "mashape2.com", port = 8002, weight = 5 },
+        })
+        b:addHost("mashape.com", 80, 10)
+        local ok, err = b:setPeerStatus(false, "mashape1.com", 80, "mashape.com")
+        assert.is_nil(ok)
+        assert.equals("no peer found by name 'mashape.com' and address mashape1.com:80", err)
+      end)
+    end)
+
   end)
   it("ringbalancer with a running timer gets GC'ed", function()
     local b = check_balancer(balancer.new {
@@ -577,7 +637,7 @@ describe("Loadbalancer", function()
       assert.equal(8001, port)
       assert.equal("gelato.io", host)
     end)
-    it("gets an IP address and port number round-robin", function()
+    it("gets an IP address and port number; round-robin", function()
       dnsA({ 
         { name = "mashape.com", address = "1.2.3.4" },
       })
@@ -603,6 +663,60 @@ describe("Loadbalancer", function()
       assert.equal(20, res["mashape.com:123"])
       assert.equal(10, res["5.6.7.8:321"])
       assert.equal(10, res["getkong.org:321"])
+    end)
+    it("gets an IP address and port number; round-robin skips unhealthy addresses", function()
+      dnsA({
+        { name = "mashape.com", address = "1.2.3.4" },
+      })
+      dnsA({ 
+        { name = "getkong.org", address = "5.6.7.8" },
+      })
+      local b = check_balancer(balancer.new { 
+        hosts = { 
+          {name = "mashape.com", port = 123, weight = 100},
+          {name = "getkong.org", port = 321, weight = 50},
+        },
+        dns = client,
+        wheelSize = 15,
+      })
+      -- mark node down
+      assert(b:setPeerStatus(false, "1.2.3.4", 123, "mashape.com"))
+      -- run down the wheel twice
+      local res = {}
+      for _ = 1, 15*2 do
+        local addr, port, host = b:getPeer()
+        res[addr..":"..port] = (res[addr..":"..port] or 0) + 1
+        res[host..":"..port] = (res[host..":"..port] or 0) + 1
+      end
+      assert.equal(nil, res["1.2.3.4:123"])     -- address got no hits, key never gets initialized
+      assert.equal(nil, res["mashape.com:123"]) -- host got no hits, key never gets initialized
+      assert.equal(30, res["5.6.7.8:321"])
+      assert.equal(30, res["getkong.org:321"])
+    end)
+    it("gets an IP address and port number; round-robin fails when all unhealthy", function()
+      dnsA({
+        { name = "mashape.com", address = "1.2.3.4" },
+      })
+      dnsA({
+        { name = "getkong.org", address = "5.6.7.8" },
+      })
+      local b = check_balancer(balancer.new {
+        hosts = {
+          {name = "mashape.com", port = 123, weight = 100},
+          {name = "getkong.org", port = 321, weight = 50},
+        },
+        dns = client,
+        wheelSize = 15,
+      })
+      -- mark all nodes down
+      assert(b:setPeerStatus(false, "1.2.3.4", 123, "mashape.com"))
+      assert(b:setPeerStatus(false, "5.6.7.8", 321, "getkong.org"))
+      -- getPeer fails with `nil` and `err` when there are no more available peers
+      for _ = 1, 15*2 do
+        local ok, err = b:getPeer()
+        assert.falsy(ok)
+        assert.same("No peers are available", err)
+      end
     end)
     it("gets an IP address and port number; consistent hashing", function()
       dnsA({ 
@@ -697,6 +811,60 @@ describe("Loadbalancer", function()
       for _,_ in pairs(res) do count = count + 1 end
       assert.equal(10, count) -- 10 unique entries
     end)
+    it("gets an IP address and port number; consistent hashing skips unhealthy addresses", function()
+      dnsA({
+        { name = "mashape.com", address = "1.2.3.4" },
+      })
+      dnsA({
+        { name = "getkong.org", address = "5.6.7.8" },
+      })
+      local b = check_balancer(balancer.new {
+        hosts = {
+          {name = "mashape.com", port = 123, weight = 100},
+          {name = "getkong.org", port = 321, weight = 50},
+        },
+        dns = client,
+        wheelSize = 15,
+      })
+      -- mark node down
+      assert(b:setPeerStatus(false, "1.2.3.4", 123, "mashape.com"))
+      -- run down the wheel twice
+      local res = {}
+      for n = 1, 15*2 do
+        local addr, port, host = b:getPeer(n)
+        res[addr..":"..port] = (res[addr..":"..port] or 0) + 1
+        res[host..":"..port] = (res[host..":"..port] or 0) + 1
+      end
+      assert.equal(nil, res["1.2.3.4:123"])     -- address got no hits, key never gets initialized
+      assert.equal(nil, res["mashape.com:123"]) -- host got no hits, key never gets initialized
+      assert.equal(30, res["5.6.7.8:321"])
+      assert.equal(30, res["getkong.org:321"])
+    end)
+    it("gets an IP address and port number; consistent hashing fails when all unhealthy", function()
+      dnsA({
+        { name = "mashape.com", address = "1.2.3.4" },
+      })
+      dnsA({
+        { name = "getkong.org", address = "5.6.7.8" },
+      })
+      local b = check_balancer(balancer.new {
+        hosts = {
+          {name = "mashape.com", port = 123, weight = 100},
+          {name = "getkong.org", port = 321, weight = 50},
+        },
+        dns = client,
+        wheelSize = 15,
+      })
+      -- mark all nodes down
+      assert(b:setPeerStatus(false, "1.2.3.4", 123, "mashape.com"))
+      assert(b:setPeerStatus(false, "5.6.7.8", 321, "getkong.org"))
+      -- getPeer fails with `nil` and `err` when there are no more available peers
+      for n = 1, 15*2 do
+        local ok, err = b:getPeer(n)
+        assert.falsy(ok)
+        assert.same("No peers are available", err)
+      end
+    end)
     it("does not hit the resolver when 'cache_only' is set", function()
       local record = dnsA({ 
         { name = "mashape.com", address = "1.2.3.4" },
@@ -735,6 +903,110 @@ describe("Loadbalancer", function()
       assert.is_nil(ip)
       assert.equals("No peers are available", port)
       assert.is_nil(host)
+    end)
+  end)
+
+  describe("setting status triggers address-callback", function()
+    it("for IP addresses", function()
+      local count_add = 0
+      local count_remove = 0
+      local b
+      b = check_balancer(balancer.new { 
+        hosts = {},  -- no hosts, so balancer is empty
+        dns = client,
+        wheelSize = 10,
+        callback = function(balancer, action, ip, port, hostname)
+          assert.equal(b, balancer)
+          if action == "added" then
+            count_add = count_add + 1
+          elseif action == "removed" then
+            count_remove = count_remove + 1
+          else
+            error("unknown action received: "..tostring(action))
+          end
+          assert.equals("12.34.56.78", ip)
+          assert.equals(123, port)
+          assert.equals("12.34.56.78", hostname)
+        end
+      })
+      b:addHost("12.34.56.78", 123, 100)
+      assert.equal(1, count_add)
+      assert.equal(0, count_remove)
+      b:removeHost("12.34.56.78", 123)
+      assert.equal(1, count_add)
+      assert.equal(1, count_remove)
+    end)
+    it("for 1 level dns", function()
+      local count_add = 0
+      local count_remove = 0
+      local b
+      b = check_balancer(balancer.new { 
+        hosts = {},  -- no hosts, so balancer is empty
+        dns = client,
+        wheelSize = 10,
+        callback = function(balancer, action, ip, port, hostname)
+          assert.equal(b, balancer)
+          if action == "added" then
+            count_add = count_add + 1
+          elseif action == "removed" then
+            count_remove = count_remove + 1
+          else
+            error("unknown action received: "..tostring(action))
+          end
+          assert.equals("12.34.56.78", ip)
+          assert.equals(123, port)
+          assert.equals("mashape.com", hostname)
+        end
+      })
+      dnsA({ 
+        { name = "mashape.com", address = "12.34.56.78" },
+        { name = "mashape.com", address = "12.34.56.78" },
+      })
+      b:addHost("mashape.com", 123, 100)
+      assert.equal(2, count_add)
+      assert.equal(0, count_remove)
+      b:removeHost("mashape.com", 123)
+      assert.equal(2, count_add)
+      assert.equal(2, count_remove)
+    end)
+    it("for 2+ level dns", function()
+      local count_add = 0
+      local count_remove = 0
+      local b
+      b = check_balancer(balancer.new { 
+        hosts = {},  -- no hosts, so balancer is empty
+        dns = client,
+        wheelSize = 10,
+        callback = function(balancer, action, ip, port, hostname)
+          assert.equal(b, balancer)
+          if action == "added" then
+            count_add = count_add + 1
+          elseif action == "removed" then
+            count_remove = count_remove + 1
+          else
+            error("unknown action received: "..tostring(action))
+          end
+          assert(ip == "mashape1.com" or ip == "mashape2.com")
+          assert(port == 8001 or port == 8002)
+          assert.equals("mashape.com", hostname)
+        end
+      })
+      dnsA({
+        { name = "mashape1.com", address = "12.34.56.1" },
+      })
+      dnsA({
+        { name = "mashape2.com", address = "12.34.56.2" },
+      })
+      dnsSRV({ 
+        { name = "mashape.com", target = "mashape1.com", port = 8001, weight = 5 },
+        { name = "mashape.com", target = "mashape2.com", port = 8002, weight = 5 },
+      })
+      b:addHost("mashape.com", 123, 100)
+      assert.equal(2, count_add)
+      assert.equal(0, count_remove)
+      b:removeHost("mashape.com", 123)
+      assert.equal(2, count_add)
+      assert.equal(2, count_remove)
     end)
   end)
 
@@ -1358,7 +1630,6 @@ describe("Loadbalancer", function()
       dnsA({ 
         { name = "getkong.org", address = "9.9.9.9" },
       })
---print("setup fake record, now creating a balancer")
       local b = check_balancer(balancer.new { 
         hosts = { 
           { name = "mashape.com", port = 80, weight = 10 }, 
@@ -1368,10 +1639,8 @@ describe("Loadbalancer", function()
         wheelSize = 20,
         requery = 1,   -- shorten default requery time for the test
       })
---print("balancer created, storing state1 + state2 here")
       local state1 = copyWheel(b)
       local state2 = copyWheel(b)
---print("reconfiguring dns client with bad nameserver...")
       -- reconfigure the dns client to make sure next query fails
       assert(client.init {
         hosts = {}, 
@@ -1382,15 +1651,12 @@ describe("Loadbalancer", function()
       -- refetch the cache, since the 'init' call above caused it to be replaced
       dnscache = client.getcache()
       record.expire = gettime() -1 -- expire current dns cache record
---print("dns client reconfigured, local cache updated (empty now). Running whole wheel...")
       -- run entire wheel to make sure the expired one is requested, so it can fail
       for _ = 1, b.wheelSize do b:getPeer() end
---print("ran down whole wheel. Now updating previous state2 to be the expected one")
       -- all slots are now getkong.org
       updateWheelState(state2, " %- 1%.2%.3%.4 @ 80 %(mashape%.com%)", " - 9.9.9.9 @ 123 (getkong.org)")
       
       assert.same(state2, copyWheel(b))
---print("asserted that the failure updated the wheel correctly by removing 'mashape.com'")
       -- reconfigure the dns client to make sure next query works again
       assert(client.init {
         hosts = {}, 
@@ -1403,13 +1669,100 @@ describe("Loadbalancer", function()
       dnsA({ 
         { name = "mashape.com", address = "1.2.3.4" },
       })
---print("client reconfigured, local cache updated, and inserted the fake record again")      
---print("waiting for timer to update the failed record...")
       sleep(b.requeryInterval + 1) --requery timer runs, so should be fixed after this
 
       -- wheel should be back in original state
---print("now checking the updated results")
       assert.same(state1, copyWheel(b))
+    end)
+    it("renewed DNS A record; last host fails DNS resolution", function()
+      -- This test might show some error output similar to the lines below. This is expected and ok.
+      -- 2017/11/06 15:52:49 [warn] 5123#0: *2 [lua] balancer.lua:320: queryDns(): [ringbalancer] querying dns for really.does.not.exist.mashape.com failed: dns server error: 3 name error, context: ngx.timer
+      
+      local test_name = "really.does.not.exist.mashape.com"
+      local ttl = 0.1
+      local staleTtl = 0   -- stale ttl = 0, force lookup upon expiring
+      local record = dnsA({ 
+        { name = test_name, address = "1.2.3.4", ttl = ttl },
+      }, staleTtl)
+      local b = check_balancer(balancer.new { 
+        hosts = { 
+          { name = test_name, port = 80, weight = 10 }, 
+        },
+        dns = client,
+      })
+      for _ = 1, b.wheelSize do
+        local ip = b:getPeer()
+        assert.equal(record[1].address, ip)
+      end
+      -- wait for ttl to expire
+      sleep(ttl + 0.1)
+      -- run entire wheel to make sure the expired one is requested, so it can fail
+      for _ = 1, b.wheelSize do
+        local ip, port = b:getPeer()
+        assert.is_nil(ip)
+        assert.equal(port, "No peers are available")
+      end
+    end)
+    it("renewed DNS A record; unhealthy entries remain unhealthy after renewal", function()
+      local record = dnsA({
+        { name = "mashape.com", address = "1.2.3.4" },
+        { name = "mashape.com", address = "1.2.3.5" },
+      })
+      dnsA({
+        { name = "getkong.org", address = "9.9.9.9" },
+      })
+      local b = check_balancer(balancer.new {
+        hosts = {
+          { name = "mashape.com", port = 80, weight = 5 },
+          { name = "getkong.org", port = 123, weight = 10 },
+        },
+        dns = client,
+        wheelSize = 20,
+      })
+
+      -- mark node down
+      assert(b:setPeerStatus(false, "1.2.3.4", 80, "mashape.com"))
+
+      -- run the wheel
+      local res = {}
+      for _ = 1, 15 do
+        local addr, port, host = b:getPeer()
+        res[addr..":"..port] = (res[addr..":"..port] or 0) + 1
+        res[host..":"..port] = (res[host..":"..port] or 0) + 1
+      end
+
+      assert.equal(nil, res["1.2.3.4:80"])    -- unhealthy node gets no hits, key never gets initialized
+      assert.equal(5, res["1.2.3.5:80"])
+      assert.equal(5, res["mashape.com:80"])
+      assert.equal(10, res["9.9.9.9:123"])
+      assert.equal(10, res["getkong.org:123"])
+
+      local state = copyWheel(b)
+
+      record.expire = gettime() -1 -- expire current dns cache record
+      dnsA({   -- create a new record (identical)
+        { name = "mashape.com", address = "1.2.3.4" },
+        { name = "mashape.com", address = "1.2.3.5" },
+      })
+      -- create a spy to check whether dns was queried
+      spy.on(client, "resolve")
+      for _ = 1, b.wheelSize do -- call all, to make sure we hit the expired one
+        b:getPeer()  -- invoke balancer, to expire record and re-query dns
+      end
+      assert.spy(client.resolve).was_called_with("mashape.com",nil, nil)
+      assert.same(state, copyWheel(b))
+
+      -- run the wheel again
+      local res2 = {}
+      for _ = 1, 15 do
+        local addr, port, host = b:getPeer()
+        res2[addr..":"..port] = (res2[addr..":"..port] or 0) + 1
+        res2[host..":"..port] = (res2[host..":"..port] or 0) + 1
+      end
+
+      -- results are identical: unhealthy node remains unhealthy
+      assert.same(res, res2)
+
     end)
     it("low weight with zero-slots assigned doesn't fail", function()
       -- depending on order of insertion it is either 1 or 0 slots
@@ -1443,6 +1796,25 @@ describe("Loadbalancer", function()
         dns = client,
         wheelSize = 100,
       })
+    end)
+    it("SRV record with 0 weight doesn't fail resolving", function()
+      -- depending on order of insertion it is either 1 or 0 slots
+      -- but it may never error.
+      dnsSRV({
+        { name = "gelato.io", target = "1.2.3.6", port = 8001, weight = 0 },
+        { name = "gelato.io", target = "1.2.3.6", port = 8002, weight = 0 },
+      })
+      local b = check_balancer(balancer.new {
+        hosts = {
+          -- port and weight will be overridden by the above
+          { name = "gelato.io", port = 80, weight = 99999 },
+        },
+        dns = client,
+        wheelSize = 100,
+      })
+      local ip, port = b:getPeer()
+      assert.equal("1.2.3.6", ip)
+      assert(port == 8001 or port == 8002, "port expected 8001 or 8002")
     end)
     it("ttl of 0 inserts only a single unresolved address", function()
       local ttl = 0

@@ -15,7 +15,7 @@
 -- the hostname to be resolved is a valid IP address, it will be cached with a ttl of 
 -- 10 years. So the user doesn't have to check for ip adresses.
 --
--- @copyright 2016 Mashape Inc.
+-- @copyright 2016-2017 Kong Inc.
 -- @author Thijs Schreijer
 -- @license Apache 2.0
 
@@ -1139,15 +1139,20 @@ local function roundRobinW(rec)
     local weightList -- weights for the entry
     local n = 0
     for i, r in ipairs(rec) do
+      -- when weight == 0 then minimal possibility of hitting it
+      -- should occur. Setting it to 1 will prevent the weight-reduction
+      -- from succeeding, hence a longer RR list is created, with
+      -- lower probability of the 0-one being hit.
+      local weight = (r.weight ~= 0 and r.weight or 1)
       if r.priority == topPriority then
         n = n + 1
         prioList[n] = i
-        weightList[n] = r.weight
+        weightList[n] = weight
       elseif r.priority < topPriority then
         n = 1
         topPriority = r.priority
         prioList = { i }
-        weightList = { r.weight }
+        weightList = { weight }
       end
     end
     md.prioList = prioList

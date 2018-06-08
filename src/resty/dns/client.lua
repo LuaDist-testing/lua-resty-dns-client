@@ -22,11 +22,14 @@
 local utils = require("resty.dns.utils")
 local fileexists = require("pl.path").exists
 local semaphore = require("ngx.semaphore").new
-
+local lrucache = require("resty.lrucache")
 local resolver = require("resty.dns.resolver")
+local deepcopy = require("pl.tablex").deepcopy
 local time = ngx.now
-local log = ngx.log
+local ngx_log = ngx.log
 local log_WARN = ngx.WARN
+local log_DEBUG = ngx.DEBUG
+local timer_at = ngx.timer.at
 
 local math_min = math.min
 local math_max = math.max
@@ -35,6 +38,7 @@ local math_random = math.random
 local table_remove = table.remove
 local table_insert = table.insert
 local table_concat = table.concat
+local string_lower = string.lower
 
 local empty = setmetatable({}, 
   {__newindex = function() error("The 'empty' table is read-only") end})
@@ -46,6 +50,9 @@ local config
 local defined_hosts        -- hash table to lookup names originating from the hosts file
 local emptyTtl             -- ttl (in seconds) for empty and 'name error' (3) errors
 local badTtl               -- ttl (in seconds) for a other dns error results
+local staleTtl             -- ttl (in seconds) to serve stale data (while new lookup is in progress)
+local cacheSize            -- size of the lru cache
+local noSynchronisation
 local orderValids = {"LAST", "SRV", "A", "AAAA", "CNAME"} -- default order to query
 for _,v in ipairs(orderValids) do orderValids[v:upper()] = v end
 
@@ -60,6 +67,10 @@ end
 -- insert our own special value for "last success"
 _M.TYPE_LAST = -1
 
+local function log(level, ...)
+  return ngx_log(level, "[dns-client] ", ...)
+end
+
 -- ==============================================
 --    In memory DNS cache
 -- ==============================================
@@ -67,90 +78,119 @@ _M.TYPE_LAST = -1
 --- Caching.
 -- The cache will not update the `ttl` field. So every time the same record
 -- is served, the ttl will be the same. But the cache will insert extra fields
--- on the top-level; `touch` (timestamp of last access) and `expire` (expiry time
--- based on `ttl`)
+-- on the top-level; `touch` (timestamp of last access), `expire` (expiry time
+-- based on `ttl`), and `expired` (boolean indicating it expired/is stale)
 -- @section caching
 
 
--- hostname cache indexed by "recordtype:hostname" returning address list.
+-- hostname lru-cache indexed by "recordtype:hostname" returning address list.
+-- short names are indexed by "recordtype:short:hostname"
 -- Result is a list with entries. 
 -- Keys only by "hostname" only contain the last succesfull lookup type 
 -- for this name, see `resolve` function.
-local cache = {}
+local dnscache
 
--- lookup a single entry in the cache. Invalidates the entry if its beyond its ttl.
--- Even if the record is expired and `nil` is returned, the second return value
--- can be `true`.
+-- lookup a single entry in the cache.
 -- @param qname name to lookup
 -- @param qtype type number, any of the TYPE_xxx constants
--- @param peek just consult the cache, do not check ttl nor expire, just touch it
--- @return 1st; cached record or nil, 2nd; expect_ttl_0, true if the last one was ttl  0
-local cachelookup = function(qname, qtype, peek)
+-- @return cached record or nil
+local cachelookup = function(qname, qtype)
   local now = time()
   local key = qtype..":"..qname
-  local cached = cache[key]
-  local expect_ttl_0
+  local cached = dnscache:get(key)
   
   if cached then
-    expect_ttl_0 = ((cached[1] or empty).ttl == 0)
-    if peek then
-      -- cannot update, just update touch time
-      cached.touch = now
-    elseif expect_ttl_0 then
-      -- ttl = 0 so we should not remove the cache entry, but we should also
-      -- not return it
-      cached.touch = now
-      cached = nil
-    elseif (cached.expire < now) then
-      -- the cached entry expired, and we're allowed to mark it as such
-      cache[key] = nil
-      cached = nil
-    else
-      -- still valid, so nothing to do
-      cached.touch = now
+    cached.touch = now
+    if (cached.expire < now) then
+      cached.expired = true
     end
   end
-  
-  return cached, expect_ttl_0
+
+  return cached
 end
 
--- inserts an entry in the cache
--- Note: if the ttl=0, then it is also stored to enable 'cache-only' lookups
--- params qname, qtype are IGNORED unless `entry` has an empty list part.
+-- inserts an entry in the cache.
+-- @param entry the dns record list to store (may also be an error entry)
+-- @param qname the name under which to store the record (optional for records, not for errors)
+-- @param qtype the query type for which to store the record (optional for records, not for errors)
+-- @return nothing
 local cacheinsert = function(entry, qname, qtype)
-
-  local ttl, key
-  local e1 = entry[1]
-  if e1 then
-    key = e1.type..":"..e1.name
-    
-    -- determine minimum ttl of all answer records
-    ttl = e1.ttl
-    for i = 2, #entry do
-      ttl = math_min(ttl, entry[i].ttl)
-    end
-  elseif entry.errcode and entry.errcode ~= 3 then
-    -- an error, but no 'name error' (3)
-    ttl = badTtl
-    key = qtype..":"..qname
-  else
-    -- empty or a 'name error' (3)
-    ttl = emptyTtl
-    key = qtype..":"..qname
-  end
- 
-  -- set expire time
+  local ttl, key, lru_ttl
   local now = time()
-  entry.touch = now
-  entry.expire = now + ttl
-  cache[key] = entry
+  local e1 = entry[1]
+
+  if not entry.expire then
+    -- new record not seen before
+    if e1 then
+      -- an actual record
+      key = (qtype or e1.type) .. ":" .. (qname or e1.name)
+      
+      -- determine minimum ttl of all answer records
+      ttl = e1.ttl
+      for i = 2, #entry do
+        ttl = math_min(ttl, entry[i].ttl)
+      end
+
+    elseif entry.errcode and entry.errcode ~= 3 then
+      -- an error, but no 'name error' (3)
+      if (cachelookup(qname, qtype) or empty)[1] then
+        -- we still have a stale record with data, so we're not replacing that
+        return
+      end
+      ttl = badTtl
+      key = qtype..":"..qname
+
+    else
+      -- empty or a 'name error' (3)
+      ttl = emptyTtl
+      key = qtype..":"..qname
+    end
+   
+    -- set expire time
+    entry.touch = now
+    entry.ttl = ttl
+    entry.expire = now + ttl
+    entry.expired = false
+    lru_ttl = ttl + staleTtl
+
+  else
+    -- an existing record reinserted (under a shortname for example)
+    -- must calculate remaining ttl, cannot get it from lrucache
+    ttl = entry.ttl
+    key = (qtype or e1.type) .. ":" .. (qname or e1.name)
+    lru_ttl = entry.expire - now + staleTtl
+  end
+
+  if lru_ttl <= 0 then
+    -- item is already expired, so we do not add it
+    dnscache:delete(key)
+    return
+  end
+
+  dnscache:set(key, entry, lru_ttl)
+end
+
+-- Lookup a shortname in the cache.
+-- @param qname the name to lookup
+-- @param qtype (optional) if not given a non-type specific query is done
+-- @return same as cachelookup
+local function cacheShortLookup(qname, qtype)
+  return cachelookup("short:" .. qname, qtype or "none")
+end
+
+-- Inserts a shortname in the cache.
+-- @param qname the name to lookup
+-- @param qtype (optional) if not given a non-type specific insertion is done
+-- @return nothing
+local function cacheShortInsert(entry, qname, qtype)
+  return cacheinsert(entry, "short:" .. qname, qtype or "none")
 end
 
 -- Lookup the last succesful query type.
 -- @param qname name to resolve
 -- @return query/record type constant, or ˋnilˋ if not found
 local function cachegetsuccess(qname)
-  return cache[qname]
+  return dnscache:get(qname)
 end
 
 -- Sets the last succesful query type.
@@ -158,52 +198,73 @@ end
 -- @qtype query/record type to set, or ˋnilˋ to clear
 -- @return ˋtrueˋ
 local function cachesetsuccess(qname, qtype)
-  cache[qname] = qtype
+  dnscache:set(qname, qtype)
   return true
 end
 
---- Cleanup the DNS client cache. Items will be checked on TTL only upon 
--- retrieval from the cache. So items inserted, but never used again will 
--- never be removed from the cache automatically. So unless you have a very 
--- restricted fixed set of hostnames you're resolving, you should occasionally 
--- purge the cache.
--- @param touched in seconds. Cleanup everything (also non-expired items) not 
--- touched in `touched` seconds. If omitted, only expired items (based on ttl) 
--- will be removed. 
--- @return number of entries deleted
-_M.purgeCache = function(touched)
-  local f
-  if type(touched == nil) then 
-    f = function(entry, now, count)  -- check ttl only
-      if entry.expire < now then
-        return nil, count + 1, true
-      else
-        return entry, count, false
-      end
-    end
-  elseif type(touched) == "number" then
-    f = function(entry, now, count)  -- check ttl and touch
-      if (entry.expire < now) or (entry.touch + touched <= now) then
-        return nil, count + 1, true
-      else
-        return entry, count, false
-      end
-    end
-  else
-    error("expected nil or number, got " ..type(touched), 2)
+
+-- =====================================================
+--    Try/status list for recursion checks and logging
+-- =====================================================
+
+local msg_mt = {
+  __tostring = function(self)
+    return table_concat(self, "/")
   end
-  local now = time()
-  local count = 0
-  local deleted
-  for key, entry in pairs(cache) do
-    if type(entry) == "table" then
-      cache[key], count, deleted = f(entry, now, count)
-    else
-      -- TODO: entry for record type, how to purge this???
+}
+
+local try_list_mt = {
+  __tostring = function(self)
+    local l, i = {}, 0
+    for _, entry in ipairs(self) do
+      l[i+1] = entry.qname
+      l[i+2] = ":"
+      l[i+3] = entry.qtype or "(na)"
+      local m = tostring(entry.msg)
+      if m == "" then
+        i = i + 4
+      else
+        l[i+4] = " - "
+        l[i+5] = m
+        i = i + 6
+      end
+      l[i]="\n"
     end
+    return table_concat(l)
   end
-  return count
+}
+
+-- adds a try to a list of tries.
+-- The list keeps track of all queries tried so far. The array part lists the
+-- order of attempts, whilst the `<qname>:<qtype>` key contains the index of that try.
+-- @param self (optional) the list to add to, if omitted a new one will be created and returned
+-- @param qname name being looked up
+-- @param qtype query type being done
+-- @param status (optional) message to be recorded
+-- @return the list
+local function try_add(self, qname, qtype, status)
+  self = self or setmetatable({}, try_list_mt)
+  local key = tostring(qname) .. ":" .. tostring(qtype)
+  local idx = #self + 1
+  self[idx] = {
+    qname = qname,
+    qtype = qtype,
+    msg = setmetatable({ status }, msg_mt),
+  }
+  self[key] = idx
+  return self
 end
+
+-- adds a status to the last try.
+-- @param self the try_list to add to
+-- @param status string with current status, added to the list for the current try
+-- @return the try_list
+local function try_status(self, status)
+  local status_list = self[#self].msg
+  status_list[#status_list + 1] = status
+  return self
+end
+
 
 -- ==============================================
 --    Main DNS functions for lookup
@@ -211,23 +272,13 @@ end
 
 --- Resolving.
 -- When resolving names, queries will be synchronized, such that only a single
--- query will be sent. Any other requests coming in while waiting for a 
--- response from the name server will be queued, and receive the same result
--- as the first request, once that returns.
--- The exception is when a `ttl=0` is expected (expectation
--- is based on a previous query returning `ttl=0`), in that case every request
--- will get its own name server query.
---
--- Because OpenResty will close sockets on boundaries of contexts, the 
--- resolver objects can only be reused in limited situations. To reuse
--- them see the `r` parameters of the `resolve` and `toip` functions. Applicable
--- for multiple consecutive calls in the same context.
+-- query will be sent. If stale data is available, the request will return
+-- stale data immediately, whilst continuing to resolve the name in the
+-- background.
 --
 -- The `dnsCacheOnly` parameter found with `resolve` and `toip` can be used in 
 -- contexts where the co-socket api is unavailable. When the flag is set
--- only cached data is returned, which is possibly stale, but it will never
--- use blocking io. Also; the stale data will not
--- be invalidated from the cache when `dnsCacheOnly` is set.
+-- only cached data is returned, but it will never use blocking io.
 --
 -- __Housekeeping__; when using `toip` it has to do some housekeeping to apply
 -- the (weighted) round-robin scheme. Those values will be stored in the 
@@ -260,11 +311,15 @@ local poolMaxRetry
 -- -- 'last'; will try the last previously successful type for a hostname.
 -- local order = { "last", "SRV", "A", "AAAA", "CNAME" } 
 --
+-- -- Stale ttl for how long a stale record will be served from the cache
+-- -- while a background lookup is in progress.
+-- local staleTtl = 4.0    -- in seconds (can have fractions)
+--
 -- -- Cache ttl for empty and 'name error' (3) responses
 -- local emptyTtl = 30.0   -- in seconds (can have fractions)
 --
 -- -- Cache ttl for other error responses
--- local badTtl = 1.0   -- in seconds (can have fractions)
+-- local badTtl = 1.0      -- in seconds (can have fractions)
 --
 -- -- `ndots`, same as the `resolv.conf` option, if not given it is taken from
 -- -- `resolv.conf` or otherwise set to 1
@@ -284,25 +339,39 @@ local poolMaxRetry
 --          search = search,
 --          order = order,
 --          badTtl = badTtl,
+--          emptyTtl = emptTtl,
+--          staleTtl = staleTtl,
 --          enable_ipv6 = enable_ipv6,
 --        })
 -- )
 _M.init = function(options)
   
+  log(log_DEBUG, "(re)configuring dns client")
   local resolv, hosts, err
   options = options or {}
-  cache = {}  -- clear cache on re-initialization
+  staleTtl = options.staleTtl or 4
+  cacheSize = options.cacheSize or 10000  -- default set here to be able to reset the cache
+  noSynchronisation = options.noSynchronisation
+
+  dnscache = lrucache.new(cacheSize)  -- clear cache on (re)initialization
   defined_hosts = {}  -- reset hosts hash table
   
   local order = options.order or orderValids
   typeOrder = {} -- clear existing upvalue
+  local ip_preference
   for i,v in ipairs(order) do 
     local t = v:upper()
+    if not ip_preference and (t == "A" or t == "AAAA") then
+      -- the first one up in the list is the IP type (v4 or v6) that we
+      -- prefer
+      ip_preference = t
+    end
     assert(orderValids[t], "Invalid dns record type in order array; "..tostring(v))
     typeOrder[i] = _M["TYPE_"..t]
   end
   assert(#typeOrder > 0, "Invalid order list; cannot be empty")
-  
+  log(log_DEBUG, "query order: ", table.concat(order,", "))
+
   
   -- Deal with the `hosts` file
   
@@ -316,10 +385,11 @@ _M.init = function(options)
     log(log_WARN, "Hosts file not found: "..tostring(hostsfile))  
     hosts = {}
   end
-  
+
   -- Populate the DNS cache with the hosts (and aliasses) from the hosts file.
   local ttl = 10*365*24*60*60  -- use ttl of 10 years for hostfile entries
   for name, address in pairs(hosts) do
+    name = string_lower(name)
     if address.ipv4 then 
       cacheinsert({{  -- NOTE: nested list! cache is a list of lists
           name = name,
@@ -328,7 +398,11 @@ _M.init = function(options)
           class = 1,
           ttl = ttl,
         }})
-      defined_hosts[name..":".._M.TYPE_A] = true 
+      defined_hosts[name..":".._M.TYPE_A] = true
+      -- cache is empty so far, so no need to check for the ip_preference
+      -- field here, just set ipv4 as success-type.
+      cachesetsuccess(name, _M.TYPE_A)
+      log(log_DEBUG, "adding from 'hosts' file: ",name, " = ", address.ipv4)
     end
     if address.ipv6 then 
       cacheinsert({{  -- NOTE: nested list! cache is a list of lists
@@ -338,7 +412,12 @@ _M.init = function(options)
           class = 1,
           ttl = ttl,
         }})
-      defined_hosts[name..":".._M.TYPE_AAAA] = true 
+      defined_hosts[name..":".._M.TYPE_AAAA] = true
+      -- do not overwrite the A success-type unless AAAA is preferred
+      if ip_preference == "AAAA" or not cachegetsuccess(name) then
+        cachesetsuccess(name, _M.TYPE_AAAA)
+      end
+      log(log_DEBUG, "adding from 'hosts' file: ",name, " = ", address.ipv6)
     end
   end
 
@@ -360,22 +439,26 @@ _M.init = function(options)
   if #(options.nameservers or {}) == 0 and resolv.nameserver then
     options.nameservers = {}
     -- some systems support port numbers in nameserver entries, so must parse those
-    for i, address in ipairs(resolv.nameserver) do
+    for _, address in ipairs(resolv.nameserver) do
       local ip, port, t = utils.parseHostname(address)
       if t == "ipv6" and not options.enable_ipv6 then
         -- should not add this one
       else
         if port then
-          options.nameservers[#options.nameservers+1] = { ip, port }
+          options.nameservers[#options.nameservers + 1] = { ip, port }
         else
-          options.nameservers[#options.nameservers+1] = ip
+          options.nameservers[#options.nameservers + 1] = ip
         end
       end
     end
   end
   assert(#(options.nameservers or {}) > 0, "Invalid configuration, no valid nameservers found")
+  for _, r in ipairs(options.nameservers) do
+    log(log_DEBUG, "nameserver ", type(r) == "table" and (r[1]..":"..r[2]) or r)
+  end
   
   options.retrans = options.retrans or resolv.options.attempts or 5 -- 5 is openresty default
+  log(log_DEBUG, "attempts ", options.retrans)
   
   if not options.timeout then
     if resolv.options.timeout then
@@ -384,6 +467,7 @@ _M.init = function(options)
       options.timeout = 2000  -- 2000 is openresty default
     end
   end
+  log(log_DEBUG, "timeout ", options.timeout, " ms")
 
   -- setup the search order
   options.ndots = options.ndots or resolv.options.ndots or 1
@@ -393,7 +477,9 @@ _M.init = function(options)
   -- other options
   
   badTtl = options.badTtl or 1
+  log(log_DEBUG, "badTtl ", badTtl, " s")
   emptyTtl = options.emptyTtl or 30
+  log(log_DEBUG, "emptyTtl ", emptyTtl, " s")
   
   -- options.no_recurse = -- not touching this one for now
   
@@ -405,225 +491,24 @@ _M.init = function(options)
   return true
 end
 
-local queue = setmetatable({}, {__mode = "v"})
--- Performs a query, but only one at a time. While the query is waiting for a response, all
--- other queries for the same name+type combo will be yielded until the first one 
--- returns. All calls will then return the same response.
--- Reason; prevent a dog-pile effect when a dns record expires. Especially under load many dns 
--- queries would be fired at the dns server if we wouldn't do this.
--- The `poolMaxWait` is how long a thread waits for another to complete the query, after the timeout it will
--- clear the token in the cache and retry (all others will become in line after this new one)
--- The `poolMaxRetry` is how often we wait for another query to complete, after this number it will return
--- an error. A retry will be performed when a) waiting for the other thread times out, or b) when the
--- query by the other thread returns an error.
--- The maximum delay would be `poolMaxWait * poolMaxRetry`.
--- @return query result + nil + r, or nil + error + r
-local function synchronizedQuery(qname, r_opts, r, expect_ttl_0, count)
-  local key = qname..":"..r_opts.qtype
-  local item = queue[key]
-  if not item then
-    -- no lookup being done so far
-    if not r then
-      local err
-      r, err = resolver:new(config)
-      if not r then
-        return r, err, nil
-      end
-    end
 
-    if expect_ttl_0 then
-      -- we're not limiting the dns queries, but query on EVERY request
-      local result, err = r:query(qname, r_opts)
-      return result, err, r
-    else
-      -- we're limiting to one request at a time
-      item = {
-        semaphore = semaphore(),
-      }
-      queue[key] = item  -- insertion in queue; this is where the synchronization starts
-      item.result, item.err = r:query(qname, r_opts)
-      -- query done, but by now many others might be waiting for our result.
-      -- 1) stop new ones from adding to our lock/semaphore
-      queue[key] = nil
-      -- 2) release all waiting threads
-      item.semaphore:post(math_max(item.semaphore:count() * -1, 1))
-      return item.result, item.err, r
-    end
-  else
-    -- lookup is on its way, wait for it
-    local ok, err = item.semaphore:wait(poolMaxWait)
-    if ok and item.result then
-      -- we were released, and have a query result from the
-      -- other thread, so all is well, return it
-      return item.result, item.err, r
-    else
-      -- there was an error, either a semaphore timeout, or 
-      -- a lookup error, so retry (retry actually means; do 
-      -- our own lookup instead of waiting for another lookup).
-      count = count or 1
-      if count > poolMaxRetry then
-        return nil, "dns lookup pool exceeded retries ("..tostring(poolMaxRetry).."): "..(item.error or err or "unknown"), r
-      end
-      if queue[key] == item then queue[key] = nil end -- don't block on the same thread again
-      return synchronizedQuery(qname, r_opts, r, expect_ttl_0, count + 1)
-    end
-  end
-end
+-- removes non-requested results, updates the cache
+-- @return `true`
+local function parseQuery(qname, qtype, answers, try_list)
 
-local msg_mt = {
-  __tostring = function(self)
-    return table_concat(self, "/")
-  end
-}
-
-local try_list_mt = {
-  __tostring = function(self)
-    local l, i = {}, 0
-    for _, entry in ipairs(self) do
-      l[i+1] = entry.qname
-      l[i+2] = ":"
-      l[i+3] = entry.qtype
-      local m = tostring(entry.msg)
-      if m == "" then
-        i = i + 4
-      else
-        l[i+4] = " - "
-        l[i+5] = m
-        i = i + 6
-      end
-      l[i]="\n"
-    end
-    return table_concat(l)
-  end
-}
-
--- adds a try to a list of tries.
--- The list keeps track of all queries tried so far. The array part lists the
--- order of attempts, whilst the `<qname>:<qtype>` key contains the index of that try.
--- @param self (optional) the list to add to, if omitted a new one will be created and returned
--- @param qname name being looked up
--- @param qtype query type being done
--- @param status (optional) message to be recorded
--- @return the list
-local function try_add(self, qname, qtype, status)
-  self = self or setmetatable({}, try_list_mt)
-  local k = tostring(qname) .. ":" .. tostring(qtype)
-  local i = #self + 1
-  self[i] = {
-    qname = qname,
-    qtype = qtype,
-    msg = setmetatable({ status }, msg_mt),
-  }
-  self[k] = i
-  return self
-end
-
--- adds a status to the last entry in the `msg` table.
-local function try_status(self, status)
-  local entry = self[#self]
-  local msg = entry.msg
-  msg[#msg + 1] = status
-  return self
-end
-
-local function check_ipv6(qname, r, try_list)
-  local check = qname
-  if check:sub(1,1) == ":" then check = "0"..check end
-  if check:sub(-1,-1) == ":" then check = check.."0" end
-  if check:find("::") then
-    -- expand double colon
-    local _, count = check:gsub(":","")
-    local ins = ":"..string.rep("0:", 8 - count)
-    check = check:gsub("::", ins, 1)  -- replace only 1 occurence!
-  end
-  local record
-  if not check:match("^%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?$") then
-    -- not a valid IPv6 address
-    -- return a "server error" as a bad IPv4 would be looked up on 
-    -- the server and return a server error as well, for consistency.
-    try_status(try_list, "bad IPv6")
-    record = {
-      errcode = 3,
-      errstr = "name error",
-    }
-  else
-    try_status(try_list, "IPv6")
-    record = {{
-      address = qname,
-      type = _M.TYPE_AAAA,
-      class = 1,
-      name = qname,
-      ttl = 10 * 365 * 24 * 60 * 60 -- TTL = 10 years
-    }}
-  end
-  cacheinsert(record, qname, _M.TYPE_AAAA)
-  return record, nil, r, try_list
-end
-
-local function check_ipv4(qname, r, try_list)
-  try_status(try_list, "IPv4")
-  local record = {{
-    address = qname,
-    type = _M.TYPE_A,
-    class = 1,
-    name = qname,
-    ttl = 10 * 365 * 24 * 60 * 60 -- TTL = 10 years
-  }}
-  cacheinsert(record, qname, _M.TYPE_A)
-  return record, nil, r, try_list
-end
-
--- will lookup in the cache, or alternatively query dns servers and populate the cache.
--- only looks up the requested type.
--- It will always add an entry for the requested name in the `try_list`.
--- @return query result + nil + r + try_list, or nil + error + r + try_list
-local function lookup(qname, r_opts, dnsCacheOnly, r, try_list)
-  local qtype = r_opts.qtype
-  
-  local record, expect_ttl_0 = cachelookup(qname, qtype, dnsCacheOnly)
-  if record then  -- cache hit
-    try_list = try_add(try_list, qname, qtype, "cache hit")
-    return record, nil, r, try_list
-  end
-  try_list = try_add(try_list, qname, qtype)
-  if not expect_ttl_0 then -- so no record, and no expected ttl, so not seen
-    -- this one recently, this is the only time we do the expensive checks
-    -- for ip addresses, as they will be inserted with a ttl of 10years and 
-    -- hence never hit this code branch again
-    if (qtype == _M.TYPE_AAAA) and qname:find(":") then
-      return check_ipv6(qname, r, try_list)    -- IPv6 or invalid
-    end
-    if (qtype == _M.TYPE_A) and qname:match("^%d%d?%d?%.%d%d?%d?%.%d%d?%d?%.%d%d?%d?$") then
-      return check_ipv4(qname, r, try_list)    -- IPv4 address
-    end
-  end
-  if dnsCacheOnly then
-    -- no active lookups allowed, so return error
-    -- NOTE: this error response should never be cached, because it is caused 
-    -- by the limited nginx context where we can't use sockets to do the lookup
-    try_status(try_list, "cache only lookup failed")
-    return {
-      errcode = 4,                                         -- standard is "server failure"
-      errstr = "server failure, cache only lookup failed", -- extended description
-    }, nil, r, try_list
-  end
-  
-  -- not found in our cache, so perform query on dns servers
-  local answers, err
-  answers, err, r = synchronizedQuery(qname, r_opts, r, expect_ttl_0)
-  if not answers then
-    try_status(try_list, tostring(err))
-    return answers, err, r, try_list
-  end
-
-  -- check our answers and store them in the cache
+  -- check the answers and store them in the cache
   -- eg. A, AAAA, SRV records may be accompanied by CNAME records
   -- store them all, leaving only the requested type in so we can return that set
   local others = {}
   for i = #answers, 1, -1 do -- we're deleting entries, so reverse the traversal
     local answer = answers[i]
+
+    -- normalize casing
+    answer.name = string_lower(answer.name)
+
     if (answer.type ~= qtype) or (answer.name ~= qname) then
       local key = answer.type..":"..answer.name
+      try_status(try_list, key .. " removed")
       local lst = others[key]
       if not lst then
         lst = {}
@@ -636,7 +521,8 @@ local function lookup(qname, r_opts, dnsCacheOnly, r, try_list)
   if next(others) then
     for _, lst in pairs(others) do
       -- only store if not already cached (this is only a 'by-product')
-      if not cachelookup(lst[1].name, lst[1].type) then
+      -- or replace it if the cache contains an error
+      if #(cachelookup(lst[1].name, lst[1].type) or empty) == 0 then
         cacheinsert(lst)
       end
       -- set success-type, only if not set (this is only a 'by-product')
@@ -647,10 +533,273 @@ local function lookup(qname, r_opts, dnsCacheOnly, r, try_list)
   end
 
   -- now insert actual target record in cache
-  try_status(try_list, "queried")
   cacheinsert(answers, qname, qtype)
-  return answers, nil, r, try_list
+  return true
 end
+
+
+-- executes 1 individual query.
+-- This query will not be synchronized, every call will be 1 query.
+-- @param qname the name to query for
+-- @param r_opts a table with the query options
+-- @param try_list the try_list object to add to
+-- @return `result + nil + try_list`, or `nil + err + try_list` in case of errors
+local function individualQuery(qname, r_opts, try_list)
+  local r, err = resolver:new(config)
+  if not r then
+    return r, "failed to create a resolver: " .. err, try_list
+  end
+
+  try_status(try_list, "querying")
+
+  local result
+  result, err = r:query(qname, r_opts)
+  if not result then
+    return result, err, try_list
+  end
+
+  parseQuery(qname, r_opts.qtype, result, try_list)
+
+  return result, nil, try_list
+end
+
+
+local queue = setmetatable({}, {__mode = "v"})
+-- to be called as a timer-callback, performs a query and returns the results
+-- in the `item` table.
+local function executeQuery(premature, item)
+  if premature then return end
+
+  local r, err = resolver:new(config)
+  if not r then
+    item.result, item.err = r, "failed to create a resolver: " .. err
+  else
+    try_status(item.try_list, "querying")
+    item.result, item.err = r:query(item.qname, item.r_opts)
+    if item.result then
+      parseQuery(item.qname, item.r_opts.qtype, item.result, item.try_list)
+    end
+  end
+
+  -- query done, but by now many others might be waiting for our result.
+  -- 1) stop new ones from adding to our lock/semaphore
+  queue[item.key] = nil
+  -- 2) release all waiting threads
+  item.semaphore:post(math_max(item.semaphore:count() * -1, 1))
+  item.semaphore = nil
+end
+
+
+-- schedules an async query.
+-- This will be synchronized, so multiple calls (sync or async) might result in 1 query.
+-- @param qname the name to query for
+-- @param r_opts a table with the query options
+-- @param try_list the try_list object to add to
+-- @return `item` table which will receive the `result` and/or `err` fields, and a
+-- `semaphore` field that can be used to wait for completion (once complete
+-- the `semaphore` field will be removed). Upon error it returns `nil+error`.
+local function asyncQuery(qname, r_opts, try_list)
+  local key = qname..":"..r_opts.qtype
+  local item = queue[key]
+  if item then
+    try_status(try_list, "in progress (async)")
+    return item    -- already in progress, return existing query
+  end
+
+  item = {
+    key = key,
+    semaphore = semaphore(),
+    qname = qname,
+    r_opts = deepcopy(r_opts),
+    try_list = try_list,
+  }
+  queue[key] = item
+
+  local ok, err = timer_at(0, executeQuery, item)
+  if not ok then
+    queue[key] = nil
+    return nil, "asyncQuery failed to create timer: "..err
+  end
+  try_status(try_list, "scheduled")
+
+  return item
+end
+
+
+-- schedules a sync query.
+-- This will be synchronized, so multiple calls (sync or async) might result in 1 query.
+-- The `poolMaxWait` is how long a thread waits for another to complete the query.
+-- The `poolMaxRetry` is how often we wait for another query to complete.
+-- The maximum delay would be `poolMaxWait * poolMaxRetry`.
+-- @param qname the name to query for
+-- @param r_opts a table with the query options
+-- @param try_list the try_list object to add to
+-- @return `result + nil + try_list`, or `nil + err + try_list` in case of errors
+local function syncQuery(qname, r_opts, try_list, count)
+  local key = qname..":"..r_opts.qtype
+  local item = queue[key]
+
+  -- if nothing is in progress, we start a new async query
+  if not item then
+    local err
+    item, err = asyncQuery(qname, r_opts, try_list)
+    if not item then
+      return item, err, try_list
+    end
+  else
+    try_status(try_list, "in progress (sync)")
+  end
+
+  -- block and wait for the async query to complete
+  local ok, err = item.semaphore:wait(poolMaxWait)
+  if ok and item.result then
+    -- we were released, and have a query result from the
+    -- other thread, so all is well, return it
+    return item.result, item.err, try_list
+  end
+
+  -- there was an error, either a semaphore timeout, or a lookup error
+  -- go retry
+  count = count or 1
+  try_status(try_list, "try "..count.." error: "..(item.err or err or "unknown"))
+  if count > poolMaxRetry then
+    return nil, "dns lookup pool exceeded retries (" ..
+                tostring(poolMaxRetry) .. "): "..tostring(item.err or err),
+                try_list
+  end
+
+  -- don't block on the same thread again, so remove it from the queue
+  if queue[key] == item then queue[key] = nil end
+
+  return syncQuery(qname, r_opts, try_list, count + 1)
+end
+
+-- will lookup a name in the cache, or alternatively query the nameservers.
+-- If nothing is in the cache, a synchronous query is performewd. If the cache
+-- contains stale data, that stale data is returned while an asynchronous
+-- lookup is started in the background.
+-- @param qname the name to look for
+-- @param r_opts a table with the query options
+-- @param dnsCacheOnly if true, no active lookup is done when there is no (stale)
+-- data. In that case an error is returned (as a dns server failure table).
+-- @param try_list the try_list object to add to
+-- @return `entry + nil + try_list`, or `nil + err + try_list`
+local function lookup(qname, r_opts, dnsCacheOnly, try_list)
+  local entry = cachelookup(qname, r_opts.qtype)
+  if not entry then
+    --not found in cache
+    if dnsCacheOnly then
+      -- we can't do a lookup, so return an error
+      try_list = try_add(try_list, qname, r_opts.qtype, "cache only lookup failed")
+      return {
+        errcode = 4,                                         -- standard is "server failure"
+        errstr = "server failure, cache only lookup failed", -- extended description
+      }, nil, try_list
+    end
+    -- perform a sync lookup, as we have no stale data to fall back to
+    try_list = try_add(try_list, qname, r_opts.qtype, "cache-miss")
+    if noSynchronisation then
+      return individualQuery(qname, r_opts, try_list)
+    end
+    return syncQuery(qname, r_opts, try_list)
+  end
+
+  try_list = try_add(try_list, qname, r_opts.qtype, "cache-hit")
+  if entry.expired then
+    -- the cached record is stale but usable, so we do a refresh query in the background
+    try_status(try_list, "stale")
+    asyncQuery(qname, r_opts, try_list)
+  end
+
+  return entry, nil, try_list
+end
+
+-- checks the query to be a valid IPv6. Inserts it in the cache or inserts
+-- an error if it is invalid
+-- @param qname the IPv6 address to check
+-- @param qtype query type performed, any of the `TYPE_xx` constants
+-- @param try_list the try_list object to add to
+-- @return record as cached, nil, try_list
+local function check_ipv6(qname, qtype, try_list)
+  try_list = try_add(try_list, qname, qtype, "IPv6")
+
+  local record = cachelookup(qname, qtype)
+  if record then
+    try_status(try_list, "cached")
+    return record, nil, try_list
+  end
+
+  local check = qname
+  if check:sub(1,1) == ":" then check = "0"..check end
+  if check:sub(-1,-1) == ":" then check = check.."0" end
+  if check:find("::") then
+    -- expand double colon
+    local _, count = check:gsub(":","")
+    local ins = ":"..string.rep("0:", 8 - count)
+    check = check:gsub("::", ins, 1)  -- replace only 1 occurence!
+  end
+  if qtype == _M.TYPE_AAAA and
+     check:match("^%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?:%x%x?%x?%x?$") then
+    try_status(try_list, "validated")
+    record = {{
+      address = qname,
+      type = _M.TYPE_AAAA,
+      class = 1,
+      name = qname,
+      ttl = 10 * 365 * 24 * 60 * 60 -- TTL = 10 years
+    }}
+    cachesetsuccess(qname, _M.TYPE_AAAA) 
+  else
+    -- not a valid IPv6 address, or a bad type (non ipv6)
+    -- return a "server error"
+    try_status(try_list, "bad IPv6")
+    record = {
+      errcode = 3,
+      errstr = "name error",
+    }
+  end
+  cacheinsert(record, qname, qtype)
+  return record, nil, try_list
+end
+
+-- checks the query to be a valid IPv4. Inserts it in the cache or inserts
+-- an error if it is invalid
+-- @param qname the IPv4 address to check
+-- @param qtype query type performed, any of the `TYPE_xx` constants
+-- @param try_list the try_list object to add to
+-- @return record as cached, nil, try_list
+local function check_ipv4(qname, qtype, try_list)
+  try_list = try_add(try_list, qname, qtype, "IPv4")
+
+  local record = cachelookup(qname, qtype)
+  if record then
+    try_status(try_list, "cached")
+    return record, nil, try_list
+  end
+
+  if qtype == _M.TYPE_A then
+    try_status(try_list, "validated")
+    record = {{
+      address = qname,
+      type = _M.TYPE_A,
+      class = 1,
+      name = qname,
+      ttl = 10 * 365 * 24 * 60 * 60 -- TTL = 10 years
+    }}
+    cachesetsuccess(qname, _M.TYPE_A) 
+  else
+    -- bad query type for this ipv4 address
+    -- return a "server error"
+    try_status(try_list, "bad IPv4")
+    record = {
+      errcode = 3,
+      errstr = "name error",
+    }
+  end
+  cacheinsert(record, qname, qtype)
+  return record, nil, try_list
+end
+
 
 -- iterator that iterates over all names and types to look up based on the
 -- provided name, the `typeOrder`, `hosts`, `ndots` and `search` settings
@@ -742,72 +891,128 @@ end
 -- - then A,
 -- - then CNAME.
 --
+-- The outer loop will be based on the `search` and `ndots` options. Within each of
+-- those, the inner loop will be the query/record type.
 -- @function resolve
 -- @param qname Name to resolve
 -- @param r_opts Options table, see remark about the `qtype` field above and 
 -- [OpenResty docs](https://github.com/openresty/lua-resty-dns) for more options.
 -- @param dnsCacheOnly Only check the cache, won't do server lookups 
--- (will not invalidate any ttl expired data and will hence possibly return
--- expired data)
--- @param r (optional) dns resolver object to use, it will also be returned. 
--- In case of multiple calls, this allows to reuse the resolver object 
--- instead of recreating a new one on each call.
 -- @param try_list (optional) list of tries to add to
--- @return `list of records + nil + r + try_list`, or `nil + err + r + try_list`.
-local function resolve(qname, r_opts, dnsCacheOnly, r, try_list)
-
-  qname = qname:lower()
+-- @return `list of records + nil + try_list`, or `nil + err + try_list`.
+local function resolve(qname, r_opts, dnsCacheOnly, try_list)
+  qname = string_lower(qname)
   local qtype = (r_opts or empty).qtype
   local err, records
+
   local opts = {}
   if r_opts then
     for k,v in pairs(r_opts) do opts[k] = v end  -- copy the options table
+  else
+
+    -- if no options table provided, set the ADDITIONAL SECTION to TRUE
+    opts.additional_section = true
   end
-  
+
+  -- first check for shortname in the cache
+  -- we do this only to prevent iterating over the SEARCH directive and
+  -- potentially requerying failed lookups in that process as the ttl for
+  -- errors is relatively short (1 second default)
+  records = cacheShortLookup(qname, qtype)
+  if records then
+    if try_list then
+      -- check for recursion
+      if try_list["(short)"..qname..":"..tostring(qtype)] then
+        records = nil
+        err = "recursion detected"
+        try_status(try_list, "recursion detected")
+        return nil, err, try_list
+      end
+    end
+
+    try_list = try_add(try_list, "(short)"..qname, qtype, "cache-hit")
+    if records.expired then
+      -- if the record is already stale/expired we have to traverse the 
+      -- iterator as that is required to start the async refresh queries
+      records = nil
+      try_list = try_status(try_list, "stale")
+
+    else
+      -- a valid non-stale record
+      -- check for CNAME records, and dereferencing the CNAME
+      if (records[1] or empty).type == _M.TYPE_CNAME and qtype ~= _M.TYPE_CNAME then
+        opts.qtype = nil
+        try_status(try_list, "dereferencing")
+        return resolve(records[1].cname, opts, dnsCacheOnly, try_list)
+      end
+
+      -- return the shortname cache hit
+      return records, nil, try_list
+    end
+  else
+    try_list = try_add(try_list, "(short)"..qname, qtype, "cache-miss")
+  end
+
+  -- check for qname being an ip address
+  local name_type = utils.hostnameType(qname)
+  if name_type ~= "name" then
+    if name_type == "ipv4" then
+      -- if no qtype is given, we're supposed to search, so forcing TYPE_A is safe
+      records, err, try_list = check_ipv4(qname, qtype or _M.TYPE_A, try_list)
+    else
+
+      -- it is 'ipv6'
+      -- if no qtype is given, we're supposed to search, so forcing TYPE_AAAA is safe
+      records, err, try_list = check_ipv6(qname, qtype or _M.TYPE_AAAA, try_list)
+    end
+
+    if records.errcode then
+      -- the query type didn't match the ip address, or a bad ip address
+      return nil, 
+             ("dns server error: %s %s"):format(records.errcode, records.errstr),
+             try_list
+    end
+    -- valid ipv4 or ipv6
+    return records, nil, try_list
+  end
+
   -- go try a sequence of record types
   for try_name, try_type in search_iter(qname, qtype) do
-    
     if try_list and try_list[try_name..":"..try_type] then
       -- recursion, been here before
       records = nil
       err = "recursion detected"
-      -- insert an entry, error will be appended at the end of the search loop
-      try_add(try_list, try_name, try_type)
+
     else
       -- go look it up
       opts.qtype = try_type
-      records, err, r, try_list = lookup(try_name, opts, dnsCacheOnly, r, try_list)
+      records, err, try_list = lookup(try_name, opts, dnsCacheOnly, try_list)
     end
-    
+
     if not records then
       -- nothing to do, an error
       -- fall through to the next entry in our search sequence
+
     elseif records.errcode then
       -- dns error: fall through to the next entry in our search sequence
       err = ("dns server error: %s %s"):format(records.errcode, records.errstr)
       records = nil
+
     elseif #records == 0 then
       -- empty: fall through to the next entry in our search sequence
       err = "dns server error: 3 name error" -- ensure same error message as "not found"
       records = nil
+
     else
-      -- we got some records
-      if not dnsCacheOnly and not qtype then
-        -- only set the last succes, if we're not searching for a specific type
-        -- and we're not limited by a cache-only request
-        cachesetsuccess(qname, try_type) -- set last succesful type resolved
-        cachesetsuccess(try_name, try_type) -- set last succesful type resolved
-      end
-      if try_type == _M.TYPE_CNAME then
-        if try_type == qtype then
-          -- a CNAME was explicitly requested, so no dereferencing
-          return records, nil, r, try_list
+      -- we got some records, update the cache
+      if not dnsCacheOnly then
+        if not qtype then
+          -- only set the last succes, if we're not searching for a specific type
+          -- and we're not limited by a cache-only request
+          cachesetsuccess(try_name, try_type) -- set last succesful type resolved
         end
-        -- dereference CNAME
-        opts.qtype = nil
-        try_status(try_list, "dereferencing")
-        return resolve(records[1].cname, opts, dnsCacheOnly, r, try_list)
       end
+
       if qtype ~= _M.TYPE_SRV and try_type == _M.TYPE_SRV then
         -- check for recursive records, but NOT when requesting SRV explicitly
         local cnt = 0
@@ -817,6 +1022,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, r, try_list)
             cnt = cnt + 1
           end
         end
+
         if cnt == #records then
           -- fully recursive SRV record, specific Kubernetes problem
           -- which generates a SRV record for each host, pointing to 
@@ -827,18 +1033,36 @@ local function resolve(qname, r_opts, dnsCacheOnly, r, try_list)
           err = "recursion detected"
         end
       end
+
       if records then
-        return records, nil, r, try_list
+        -- we have a result
+
+        -- cache it under its shortname
+        if not dnsCacheOnly then
+          cacheShortInsert(records, qname, qtype)
+        end
+
+        -- check if we need to dereference a CNAME
+        if records[1].type == _M.TYPE_CNAME and qtype ~= _M.TYPE_CNAME then
+          -- dereference CNAME
+          opts.qtype = nil
+          try_status(try_list, "dereferencing")
+          return resolve(records[1].cname, opts, dnsCacheOnly, try_list)
+        end
+
+        return records, nil, try_list
       end
     end
+
     -- we had some error, record it in the status list
     try_status(try_list, err)
   end
+
   -- we failed, clear cache and return last error
   if not dnsCacheOnly then
     cachesetsuccess(qname, nil)
   end
-  return nil, err, r, try_list
+  return nil, err, try_list
 end
 
 -- returns the index of the record next up in the round-robin scheme.
@@ -997,33 +1221,37 @@ end
 --   - `127.0.0.1, 80`
 --   - `127.0.0.1, 80`   (completes WRR 1st level, 2nd run, with different order as WRR is randomized)
 --
+-- __Debugging__:
+--
+-- This function both takes and returns a `try_list`. This is an internal object
+-- representing the entire resolution history for a call. To prevent unnecessary
+-- string concatenations on a hot code path, it is not logged in this module.
+-- If you need to log it, just log `tostring(try_list)` from the caller code.
 -- @function toip
 -- @param qname hostname to resolve
 -- @param port (optional) default port number to return if none was found in 
 -- the lookup chain (only SRV records carry port information, SRV with `port=0` will be ignored)
 -- @param dnsCacheOnly Only check the cache, won't do server lookups (will 
 -- not invalidate any ttl expired data and will hence possibly return expired data)
--- @param r (optional) dns resolver object to use, it will also be returned. 
--- In case of multiple calls, this allows to reuse the resolver object instead 
--- of recreating a new one on each call.
 -- @param try_list (optional) list of tries to add to
 -- @return `ip address + port + r + try_list`, or in case of an error `nil + error + r + try_list`
-local function toip(qname, port, dnsCacheOnly, r, try_list)
+local function toip(qname, port, dnsCacheOnly, try_list)
   local rec, err
-  rec, err, r, try_list = resolve(qname, nil, dnsCacheOnly, r, try_list)
+  rec, err, try_list = resolve(qname, nil, dnsCacheOnly, try_list)
   if err then
-    return nil, err, r, try_list
+    return nil, err, try_list
   end
 
+--print(tostring(try_list))
   if rec[1].type == _M.TYPE_SRV then
     local entry = rec[roundRobinW(rec)]
     -- our SRV entry might still contain a hostname, so recurse, with found port number
     local srvport = (entry.port ~= 0 and entry.port) or port -- discard port if it is 0
     try_status(try_list, "dereferencing SRV")
-    return toip(entry.target, srvport, dnsCacheOnly, r, try_list)
+    return toip(entry.target, srvport, dnsCacheOnly, try_list)
   else
     -- must be A or AAAA
-    return rec[roundRobin(rec)].address, port, r, try_list
+    return rec[roundRobin(rec)].address, port, try_list
   end
 end
 
@@ -1087,7 +1315,7 @@ _M.setpeername = setpeername
 
 -- export the locals in case we're testing
 if _TEST then 
-  _M.getcache = function() return cache end 
+  _M.getcache = function() return dnscache end 
   _M._search_iter = search_iter -- export as different name!
 end 
 

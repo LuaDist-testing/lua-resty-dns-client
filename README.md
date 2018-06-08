@@ -35,6 +35,17 @@ use the `rbusted` script.
 History
 =======
 
+### 0.6.0 (14-Jun-2017) Rewritten resolver core to resolve async
+
+- Added: resolution will be done async whenever possible. For this to work a new
+  setting has been introduced `staleTtl` which determines for how long stale
+  records will returned while a query is in progress in the background.
+- Change: BREAKING! several functions that previously returned and took a
+  resolver object no longer do so.
+- Fix: no longer lookup ip adresses as names if the query type is not A or AAAA
+- Fix: normalize names to lowercase after query
+- Fix: set last-success types for hosts-file entries and ip-addresses
+
 ### 0.5.0 (25-Apr-2017) implement SEARCH and NDOTS
 
 - Removed: BREAKING! stdError function removed.

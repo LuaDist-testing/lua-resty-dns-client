@@ -555,6 +555,28 @@ describe("Loadbalancer", function()
   end)
 
   describe("getting targets", function()
+    it("gets an IP address, port and hostname for named SRV entries", function()
+      -- this case is special because it does a last-minute `toip` call and hence
+      -- uses a different code branch
+      -- See issue #17
+      dnsA({ 
+        { name = "mashape.com", address = "1.2.3.4" },
+      })
+      dnsSRV({ 
+        { name = "gelato.io", target = "mashape.com", port = 8001 },
+      })
+      local b = check_balancer(balancer.new { 
+        hosts = { 
+          {name = "gelato.io", port = 123, weight = 100},
+        },
+        dns = client,
+      })
+      -- run down the wheel twice
+      local addr, port, host = b:getPeer()
+      assert.equal("1.2.3.4", addr)
+      assert.equal(8001, port)
+      assert.equal("gelato.io", host)
+    end)
     it("gets an IP address and port number round-robin", function()
       dnsA({ 
         { name = "mashape.com", address = "1.2.3.4" },
@@ -1027,7 +1049,7 @@ describe("Loadbalancer", function()
       }, count)
       
       -- expire the existing record
-      record.expire = gettime() - 1
+      record.expire = 0
       record.expired = true
       -- do a lookup to trigger the async lookup
       client.resolve("does.not.exist.mashape.com", {qtype = client.TYPE_A})

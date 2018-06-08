@@ -105,9 +105,7 @@ function objAddr:getPeer(cacheOnly)
   if self.ipType == "name" then
     -- SRV type record with a named target
     local ip, port = dns.toip(self.ip, self.port, cacheOnly)
-    -- TODO: which is the proper name to return in this case?
-    -- `self.host.hostname`? or the named SRV entry: `self.ip`?
-    return ip, port, self.host.hostname
+    return ip, port, self.host.name
   else
     -- just an IP address
     return self.ip, self.port, self.host.hostname
@@ -290,7 +288,7 @@ function objHost:queryDns(cacheOnly)
   -- yield (cosockets in the dns lib). So once that is done, we're 'atomic'
   -- again, and we shouldn't have any nasty race conditions
   local dns = self.balancer.dns
-  local newQuery, err = dns.stdError(dns.resolve(self.hostname, nil, cacheOnly))
+  local newQuery, err = dns.resolve(self.hostname, nil, cacheOnly)
 
   local oldQuery = self.lastQuery or {}
   local oldSorted = self.lastSorted or {}

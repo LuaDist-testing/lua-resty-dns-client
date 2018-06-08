@@ -39,6 +39,10 @@ _M.DEFAULT_RESOLV_CONF = _DEFAULT_RESOLV_CONF
 -- @field MAXNS Defaults to 3
 _M.MAXNS = 3
 
+--- Maximum number of entries to parse from `search` parameter in the `resolv.conf` file
+-- @field MAXSEARCH Defaults to 6
+_M.MAXSEARCH = 6
+
 --- Parsing configuration files and variables
 -- @section parsing
 
@@ -130,7 +134,8 @@ end
 -- will be ignored. Might return `nil + error` if the file cannot be read.
 -- @param filename (optional) File to parse (defaults to `'/etc/resolv.conf'` if 
 -- omitted) or a table with the file contents in lines.
--- @return a table with fields `nameserver` (table), `domain` (string), `search` (table), `sortlist` (table) and `options` (table)
+-- @return a table with fields `nameserver` (table), `domain` (string), `search` (table),
+-- `sortlist` (table) and `options` (table)
 -- @see applyEnv
 _M.parseResolvConf = function(filename)
   local lines
@@ -159,7 +164,9 @@ _M.parseResolvConf = function(filename)
         local search = {}
         result.search = search
         for host in details:gmatch("%S+") do
-          tinsert(search, host:lower())
+          if #search < _M.MAXSEARCH then
+            tinsert(search, host:lower())
+          end
         end
       elseif option == "sortlist" then
         local list = {}
@@ -293,6 +300,26 @@ _M.hostnameType = function(name)
   if colons > 1 then return "ipv6" end
   if remainder:match("^[%d%.]+$") then return "ipv4" end
   return "name"
+end
+
+--- parses a hostname with an optional port.
+-- Does not validate the name/ip.
+-- @param name the string to check (this may contain a port number)
+-- @return `name/ip` + `port (or nil)` + `type` (one of: `"ipv4"`, `"ipv6"`, or `"name"`)
+_M.parseHostname = function(name)
+  local t = _M.hostnameType(name)
+  if t == "ipv4" then
+    local ip, port = name:match("^([^:]+)%:*(%d*)$")
+    return ip, tonumber(port), t
+  elseif t == "ipv6" then
+    if name:match("%[") then  -- brackets, so possibly a port
+      local ip, port = name:match("^%[([^%]]+)%]*%:*(%d*)$")
+      return "["..ip.."]", tonumber(port), t
+    end
+    return "["..name.."]", nil, t  -- no brackets also means no port
+  end
+  local host, port = name:match("^(.-)%:*(%d*)$")
+  return host, tonumber(port), t
 end
 
 return _M

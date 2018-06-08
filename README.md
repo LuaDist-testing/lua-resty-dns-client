@@ -35,22 +35,24 @@ use the `rbusted` script.
 History
 =======
 
-### 0.4.3 (17-Aug-2017) Bugfix
+### 0.5.0 (25-Apr-2017) implement SEARCH and NDOTS
 
-- Fix: return proper hostname for named SRV entries in the balancer
-- Fix: skip adding IPv6 nameservers, instead of nil insertion
-- Change: added logging on debug level
-
-### 0.4.2 (25-May-2017) Bugfix
-
-- Fix: do not try to lookup ip addresses for non- A or AAAA records
-- Fix: normalize names to lowercase to prevent case issues
-- Added: more verbose logging (debug level)
+- Removed: BREAKING! stdError function removed.
+- Added: implemented the `search` and `ndots` options.
+- Change: `resolve` no longer returns empty results or dns errors as a table
+  but as lua errors (`nil + error`).
+- Change: `toip()` and `resolve()` have an extra result; history. A table with
+  the list of tried names/types/results.
+- Fix: timeout and retrans options from `resolv.conf` were ignored by the
+  `client` module.
+- Fix: nameservers with an ipv6 address would not be used properly. Also
+  added a flag `enable_ipv6` (default == `false`) to enable the useage of
+  ipv6 nameservers.
 
 ### 0.4.1 (21-Apr-2017) Bugfix
 
-- fix: cname record caching causing excessive dns queries
-  See [Kong issue #2303](https://github.com/Mashape/kong/issues/2303)
+- Fix: cname record caching causing excessive dns queries,
+  see [Kong issue #2303](https://github.com/Mashape/kong/issues/2303).
 
 ### 0.4.0 (30-Mar-2017) Bugfixes
 

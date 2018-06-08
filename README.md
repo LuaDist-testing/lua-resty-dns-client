@@ -37,6 +37,20 @@ History
 
 Versioning is strictly based on [Semantic Versioning](https://semver.org/)
 
+### 2.0.0 (22-Feb-2018) Major performance improvement (balancer) and bugfixes
+
+- BREAKING: improved performance and memory footprint for large balancers.
+  80-85% less memory will be used, while creation time dropped by 85-90%. Since
+  the `host:getPeer()` function signature changed, this is a breaking change.
+- Change: BREAKING the errors for cache-only lookup failures and empty records
+  have been changed.
+- Fix: do not fail initialization without nameservers. 
+- Fix: properly recognize IPv6 in square brackets from the /etc/hosts file.
+- Fix: do not set success-type to types we're not looking for. Fixes
+  [Kong issue #3210](https://github.com/Kong/kong/issues/3210).
+- Fix: store records from the additional section in cache
+- Fix: do not overwrite stale data in the client cache with empty records
+
 ### 1.0.0 (14-Dec-2017) Fixes and IPv6
 
 - Change: BREAKING all IPv6 addresses are now returned with square brackets

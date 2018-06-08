@@ -26,9 +26,10 @@ local lrucache = require("resty.lrucache")
 local resolver = require("resty.dns.resolver")
 local deepcopy = require("pl.tablex").deepcopy
 local time = ngx.now
-local ngx_log = ngx.log
-local log_WARN = ngx.WARN
-local log_DEBUG = ngx.DEBUG
+local log = ngx.log
+local WARN = ngx.WARN
+local DEBUG = ngx.DEBUG
+local PREFIX = "[dns-client] "
 local timer_at = ngx.timer.at
 
 local math_min = math.min
@@ -54,6 +55,12 @@ local staleTtl             -- ttl (in seconds) to serve stale data (while new lo
 local cacheSize            -- size of the lru cache
 local noSynchronisation
 local orderValids = {"LAST", "SRV", "A", "AAAA", "CNAME"} -- default order to query
+local typeOrder            -- array with order of types to try
+local clientErrors = {     -- client specific errors
+  [100] = "cache only lookup failed",
+  [101] = "empty record received",
+}
+
 for _,v in ipairs(orderValids) do orderValids[v:upper()] = v end
 
 -- create module table
@@ -67,9 +74,27 @@ end
 -- insert our own special value for "last success"
 _M.TYPE_LAST = -1
 
-local function log(level, ...)
-  return ngx_log(level, "[dns-client] ", ...)
+
+-- ==============================================
+--    Debugging aid
+-- ==============================================
+-- to be enabled manually by doing a replace-all on the
+-- long comment start.
+--[[
+local json = require("cjson").encode
+
+local function fquery(item)
+  return (tostring(item):gsub("table: ", "query="))
 end
+
+local function frecord(record)
+  if type(record) ~= "table" then
+    return tostring(record)
+  end
+  return (tostring(record):gsub("table: ", "record=")) .. " " .. json(record)
+end
+--]]
+
 
 -- ==============================================
 --    In memory DNS cache
@@ -103,7 +128,18 @@ local cachelookup = function(qname, qtype)
     cached.touch = now
     if (cached.expire < now) then
       cached.expired = true
+      --[[
+      log(DEBUG, PREFIX, "cache get (stale): ", key, " ", frecord(cached))
+      --]]
+    else
+      --[[
+      log(DEBUG, PREFIX, "cache get: ", key, " ", frecord(cached))
+      --]]
     end
+  else
+    --[[
+    log(DEBUG, PREFIX, "cache get (miss): ", key)
+    --]]
   end
 
   return cached
@@ -122,7 +158,7 @@ local cacheinsert = function(entry, qname, qtype)
   if not entry.expire then
     -- new record not seen before
     if e1 then
-      -- an actual record
+      -- an actual, non-empty, record
       key = (qtype or e1.type) .. ":" .. (qname or e1.name)
       
       ttl = math.huge
@@ -142,13 +178,28 @@ local cacheinsert = function(entry, qname, qtype)
       -- an error, but no 'name error' (3)
       if (cachelookup(qname, qtype) or empty)[1] then
         -- we still have a stale record with data, so we're not replacing that
+        --[[
+        log(DEBUG, PREFIX, "cache set (skip on name error): ", key, " ", frecord(entry))
+        --]]
         return
       end
       ttl = badTtl
       key = qtype..":"..qname
 
+    elseif entry.errcode == 3 then
+      -- a 'name error' (3)
+      ttl = emptyTtl
+      key = qtype..":"..qname
+
     else
-      -- empty or a 'name error' (3)
+      -- empty record
+      if (cachelookup(qname, qtype) or empty)[1] then
+        -- we still have a stale record with data, so we're not replacing that
+        --[[
+        log(DEBUG, PREFIX, "cache set (skip on empty): ", key, " ", frecord(entry))
+        --]]
+        return
+      end
       ttl = emptyTtl
       key = qtype..":"..qname
     end
@@ -159,6 +210,9 @@ local cacheinsert = function(entry, qname, qtype)
     entry.expire = now + ttl
     entry.expired = false
     lru_ttl = ttl + staleTtl
+    --[[
+    log(DEBUG, PREFIX, "cache set (new): ", key, " ", frecord(entry))
+    --]]
 
   else
     -- an existing record reinserted (under a shortname for example)
@@ -166,11 +220,17 @@ local cacheinsert = function(entry, qname, qtype)
     ttl = entry.ttl
     key = (qtype or e1.type) .. ":" .. (qname or e1.name)
     lru_ttl = entry.expire - now + staleTtl
+    --[[
+    log(DEBUG, PREFIX, "cache set (existing): ", key, " ", frecord(entry))
+    --]]
   end
 
   if lru_ttl <= 0 then
     -- item is already expired, so we do not add it
     dnscache:delete(key)
+    --[[
+    log(DEBUG, PREFIX, "cache set (delete on expired): ", key, " ", frecord(entry))
+    --]]
     return
   end
 
@@ -201,11 +261,33 @@ local function cachegetsuccess(qname)
 end
 
 -- Sets the last succesful query type.
--- @qparam name resolved
--- @qtype query/record type to set, or ˋnilˋ to clear
--- @return ˋtrueˋ
+-- Only if the type provided is in the list of types to try.
+-- @param qname name resolved
+-- @param qtype query/record type to set, or ˋnilˋ to clear
+-- @return `true` if set, or `false` if not
 local function cachesetsuccess(qname, qtype)
+
+  -- Test whether the qtype value is in our search/order list
+  local validType = false
+  for _, t in ipairs(typeOrder) do
+    if t == qtype then
+      validType = true
+      break
+    end
+  end
+  if not validType then
+    -- the qtype is not in the list, so we're not setting it as the
+    -- success type
+    --[[
+    log(DEBUG, PREFIX, "cache set success (skip on bad type): ", qname, ", ", qtype)
+    --]]
+    return false
+  end
+
   dnscache:set(qname, qtype)
+  --[[
+  log(DEBUG, PREFIX, "cache set success: ", qname, " = ", qtype)
+  --]]
   return true
 end
 
@@ -289,7 +371,6 @@ end
 -- @section resolving
 
 
-local typeOrder
 local poolMaxWait
 local poolMaxRetry
 
@@ -347,12 +428,14 @@ local poolMaxRetry
 -- )
 _M.init = function(options)
   
-  log(log_DEBUG, "(re)configuring dns client")
+  log(DEBUG, PREFIX, "(re)configuring dns client")
   local resolv, hosts, err
   options = options or {}
   staleTtl = options.staleTtl or 4
+  log(DEBUG, PREFIX, "staleTtl = ", staleTtl)
   cacheSize = options.cacheSize or 10000  -- default set here to be able to reset the cache
   noSynchronisation = options.noSynchronisation
+  log(DEBUG, PREFIX, "noSynchronisation = ", tostring(noSynchronisation))
 
   dnscache = lrucache.new(cacheSize)  -- clear cache on (re)initialization
   defined_hosts = {}  -- reset hosts hash table
@@ -371,7 +454,7 @@ _M.init = function(options)
     typeOrder[i] = _M["TYPE_"..t]
   end
   assert(#typeOrder > 0, "Invalid order list; cannot be empty")
-  log(log_DEBUG, "query order: ", table.concat(order,", "))
+  log(DEBUG, PREFIX, "query order = ", table_concat(order,", "))
 
   
   -- Deal with the `hosts` file
@@ -383,7 +466,7 @@ _M.init = function(options)
     hosts, err = utils.parseHosts(hostsfile)  -- results will be all lowercase!
     if not hosts then return hosts, err end
   else
-    log(log_WARN, "Hosts file not found: "..tostring(hostsfile))  
+    log(WARN, PREFIX, "Hosts file not found: "..tostring(hostsfile))
     hosts = {}
   end
 
@@ -403,7 +486,7 @@ _M.init = function(options)
       -- cache is empty so far, so no need to check for the ip_preference
       -- field here, just set ipv4 as success-type.
       cachesetsuccess(name, _M.TYPE_A)
-      log(log_DEBUG, "adding from 'hosts' file: ",name, " = ", address.ipv4)
+      log(DEBUG, PREFIX, "adding A-record from 'hosts' file: ",name, " = ", address.ipv4)
     end
     if address.ipv6 then 
       cacheinsert({{  -- NOTE: nested list! cache is a list of lists
@@ -418,7 +501,7 @@ _M.init = function(options)
       if ip_preference == "AAAA" or not cachegetsuccess(name) then
         cachesetsuccess(name, _M.TYPE_AAAA)
       end
-      log(log_DEBUG, "adding from 'hosts' file: ",name, " = ", address.ipv6)
+      log(DEBUG, PREFIX, "adding AAAA-record from 'hosts' file: ",name, " = ", address.ipv6)
     end
   end
 
@@ -432,7 +515,7 @@ _M.init = function(options)
     resolv, err = utils.applyEnv(utils.parseResolvConf(resolvconffile))
     if not resolv then return resolv, err end
   else
-    log(log_WARN, "Resolv.conf file not found: "..tostring(resolvconffile))  
+    log(WARN, PREFIX, "Resolv.conf file not found: "..tostring(resolvconffile))
     resolv = {}
   end
   if not resolv.options then resolv.options = {} end
@@ -444,7 +527,7 @@ _M.init = function(options)
       local ip, port, t = utils.parseHostname(address)
       if t == "ipv6" and not options.enable_ipv6 then
         -- should not add this one
-        log(log_DEBUG, "skipping IPv6 nameserver ", port and (ip..":"..port) or ip)
+        log(DEBUG, PREFIX, "skipping IPv6 nameserver ", port and (ip..":"..port) or ip)
       else
         if port then
           options.nameservers[#options.nameservers + 1] = { ip, port }
@@ -454,13 +537,17 @@ _M.init = function(options)
       end
     end
   end
-  assert(#(options.nameservers or {}) > 0, "Invalid configuration, no valid nameservers found")
-  for _, r in ipairs(options.nameservers) do
-    log(log_DEBUG, "nameserver ", type(r) == "table" and (r[1]..":"..r[2]) or r)
+  options.nameservers = options.nameservers or {}
+  if #options.nameservers == 0 then
+    log(WARN, PREFIX, "Invalid configuration, no valid nameservers found")
+  else
+    for _, r in ipairs(options.nameservers) do
+      log(DEBUG, PREFIX, "nameserver ", type(r) == "table" and (r[1]..":"..r[2]) or r)
+    end
   end
   
   options.retrans = options.retrans or resolv.options.attempts or 5 -- 5 is openresty default
-  log(log_DEBUG, "attempts ", options.retrans)
+  log(DEBUG, PREFIX, "attempts = ", options.retrans)
   
   if not options.timeout then
     if resolv.options.timeout then
@@ -469,19 +556,21 @@ _M.init = function(options)
       options.timeout = 2000  -- 2000 is openresty default
     end
   end
-  log(log_DEBUG, "timeout ", options.timeout, " ms")
+  log(DEBUG, PREFIX, "timeout = ", options.timeout, " ms")
 
   -- setup the search order
   options.ndots = options.ndots or resolv.options.ndots or 1
+  log(DEBUG, PREFIX, "ndots = ", options.ndots)
   options.search = options.search or resolv.search or { resolv.domain }
+  log(DEBUG, PREFIX, "search = ", table_concat(options.search,", "))
   
   
   -- other options
   
   badTtl = options.badTtl or 1
-  log(log_DEBUG, "badTtl ", badTtl, " s")
+  log(DEBUG, PREFIX, "badTtl = ", badTtl, " s")
   emptyTtl = options.emptyTtl or 30
-  log(log_DEBUG, "emptyTtl ", emptyTtl, " s")
+  log(DEBUG, PREFIX, "emptyTtl = ", emptyTtl, " s")
   
   -- options.no_recurse = -- not touching this one for now
   
@@ -494,9 +583,10 @@ _M.init = function(options)
 end
 
 
--- removes non-requested results, updates the cache
+-- Removes non-requested results, updates the cache.
+-- Parameter `answers` is updated in-place.
 -- @return `true`
-local function parseQuery(qname, qtype, answers, try_list)
+local function parseAnswer(qname, qtype, answers, try_list)
 
   -- check the answers and store them in the cache
   -- eg. A, AAAA, SRV records may be accompanied by CNAME records
@@ -522,11 +612,7 @@ local function parseQuery(qname, qtype, answers, try_list)
   end
   if next(others) then
     for _, lst in pairs(others) do
-      -- only store if not already cached (this is only a 'by-product')
-      -- or replace it if the cache contains an error
-      if #(cachelookup(lst[1].name, lst[1].type) or empty) == 0 then
-        cacheinsert(lst)
-      end
+      cacheinsert(lst)
       -- set success-type, only if not set (this is only a 'by-product')
       if not cachegetsuccess(lst[1].name) then
         cachesetsuccess(lst[1].name, lst[1].type)
@@ -560,7 +646,7 @@ local function individualQuery(qname, r_opts, try_list)
     return result, err, try_list
   end
 
-  parseQuery(qname, r_opts.qtype, result, try_list)
+  parseAnswer(qname, r_opts.qtype, result, try_list)
 
   return result, nil, try_list
 end
@@ -576,10 +662,25 @@ local function executeQuery(premature, item)
   if not r then
     item.result, item.err = r, "failed to create a resolver: " .. err
   else
+    --[[
+    log(DEBUG, PREFIX, "Query executing: ", item.qname, ":", item.r_opts.qtype, " ", fquery(item))
+    --]]
     try_status(item.try_list, "querying")
     item.result, item.err = r:query(item.qname, item.r_opts)
     if item.result then
-      parseQuery(item.qname, item.r_opts.qtype, item.result, item.try_list)
+      --[[
+      log(DEBUG, PREFIX, "Query answer: ", item.qname, ":", item.r_opts.qtype, " ", fquery(item),
+              " ", frecord(item.result))
+      --]]
+      parseAnswer(item.qname, item.r_opts.qtype, item.result, item.try_list)
+      --[[
+      log(DEBUG, PREFIX, "Query parsed answer: ", item.qname, ":", item.r_opts.qtype, " ", fquery(item),
+              " ", frecord(item.result))
+      --]]
+    else
+      --[[
+      log(DEBUG, PREFIX, "Query error: ", item.qname, ":", item.r_opts.qtype, " err=", tostring(err))
+      --]]
     end
   end
 
@@ -604,6 +705,9 @@ local function asyncQuery(qname, r_opts, try_list)
   local key = qname..":"..r_opts.qtype
   local item = queue[key]
   if item then
+    --[[
+    log(DEBUG, PREFIX, "Query async (exists): ", key, " ", fquery(item))
+    --]]
     try_status(try_list, "in progress (async)")
     return item    -- already in progress, return existing query
   end
@@ -622,6 +726,9 @@ local function asyncQuery(qname, r_opts, try_list)
     queue[key] = nil
     return nil, "asyncQuery failed to create timer: "..err
   end
+  --[[
+  log(DEBUG, PREFIX, "Query async (scheduled): ", key, " ", fquery(item))
+  --]]
   try_status(try_list, "scheduled")
 
   return item
@@ -640,15 +747,22 @@ end
 local function syncQuery(qname, r_opts, try_list, count)
   local key = qname..":"..r_opts.qtype
   local item = queue[key]
+  count = count or 1
 
   -- if nothing is in progress, we start a new async query
   if not item then
     local err
     item, err = asyncQuery(qname, r_opts, try_list)
+    --[[
+    log(DEBUG, PREFIX, "Query sync (new): ", key, " ", fquery(item)," count=", count)
+    --]]
     if not item then
       return item, err, try_list
     end
   else
+    --[[
+    log(DEBUG, PREFIX, "Query sync (exists): ", key, " ", fquery(item)," count=", count)
+    --]]
     try_status(try_list, "in progress (sync)")
   end
 
@@ -657,14 +771,20 @@ local function syncQuery(qname, r_opts, try_list, count)
   if ok and item.result then
     -- we were released, and have a query result from the
     -- other thread, so all is well, return it
+    --[[
+    log(DEBUG, PREFIX, "Query sync result: ", key, " ", fquery(item),
+           " result: ", json({ result = item.result, err = item.err}))
+    --]]
     return item.result, item.err, try_list
   end
 
   -- there was an error, either a semaphore timeout, or a lookup error
   -- go retry
-  count = count or 1
   try_status(try_list, "try "..count.." error: "..(item.err or err or "unknown"))
   if count > poolMaxRetry then
+    --[[
+    log(DEBUG, PREFIX, "Query sync (fail): ", key, " ", fquery(item)," retries exceeded. count=", count)
+    --]]
     return nil, "dns lookup pool exceeded retries (" ..
                 tostring(poolMaxRetry) .. "): "..tostring(item.err or err),
                 try_list
@@ -673,6 +793,9 @@ local function syncQuery(qname, r_opts, try_list, count)
   -- don't block on the same thread again, so remove it from the queue
   if queue[key] == item then queue[key] = nil end
 
+  --[[
+  log(DEBUG, PREFIX, "Query sync (fail): ", key, " ", fquery(item)," retrying. count=", count)
+  --]]
   return syncQuery(qname, r_opts, try_list, count + 1)
 end
 
@@ -692,10 +815,13 @@ local function lookup(qname, r_opts, dnsCacheOnly, try_list)
     --not found in cache
     if dnsCacheOnly then
       -- we can't do a lookup, so return an error
+      --[[
+      log(DEBUG, PREFIX, "Lookup, cache only failure: ", qname, " = ", r_opts.qtype)
+      --]]
       try_list = try_add(try_list, qname, r_opts.qtype, "cache only lookup failed")
       return {
-        errcode = 4,                                         -- standard is "server failure"
-        errstr = "server failure, cache only lookup failed", -- extended description
+        errcode = 100,
+        errstr = clientErrors[100]
       }, nil, try_list
     end
     -- perform a sync lookup, as we have no stale data to fall back to
@@ -1007,7 +1133,7 @@ local function resolve(qname, r_opts, dnsCacheOnly, try_list)
 
     elseif #records == 0 then
       -- empty: fall through to the next entry in our search sequence
-      err = "dns server error: 3 name error" -- ensure same error message as "not found"
+      err = ("dns client error: %s %s"):format(101, clientErrors[101])
       records = nil
 
     else
